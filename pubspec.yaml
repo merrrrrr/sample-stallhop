@@ -1,0 +1,55 @@
+name: stallhop
+description: "StallHop — food-court ordering app (customer / vendor / admin)."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase
+  firebase_core: ^3.9.0
+  firebase_auth: ^5.5.0
+  cloud_firestore: ^5.6.0
+  firebase_storage: ^12.4.0
+  firebase_messaging: ^15.2.0
+  cloud_functions: ^5.3.0
+
+  # Auth
+  google_sign_in: ^6.2.2
+
+  # State management
+  provider: ^6.1.2
+
+  # QR
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^6.0.0
+
+  # Maps
+  google_maps_flutter: ^2.10.0
+  geolocator: ^13.0.2
+
+  # Image
+  image_picker: ^1.1.2
+  cached_network_image: ^3.4.1
+
+  # UI helpers
+  intl: ^0.19.0
+  flutter_rating_bar: ^4.0.1
+  fl_chart: ^0.70.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  mockito: ^5.4.4
+  build_runner: ^2.4.13
+  fake_cloud_firestore: ^3.1.0
+
+flutter:
+  uses-material-design: true
