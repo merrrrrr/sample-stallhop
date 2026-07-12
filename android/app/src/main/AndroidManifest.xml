@@ -3,7 +3,7 @@
          flutter_local_notifications on app start. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
-        android:label="stallhop"
+        android:label="StallHop"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

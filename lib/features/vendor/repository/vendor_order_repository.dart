@@ -19,8 +19,8 @@ class VendorOrderRepository {
     FirestoreService? firestore,
     OrderRepository? orderRepository,
   })  : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(),
-        _orderRepository = orderRepository ?? OrderRepository();
+        _firestore = firestore ?? FirestoreService(db: db),
+        _orderRepository = orderRepository ?? OrderRepository(db: db);
 
   CollectionReference<Map<String, dynamic>> get _stalls =>
       _db.collection(AppConstants.stallsCollection);

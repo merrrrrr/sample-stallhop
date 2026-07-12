@@ -13,7 +13,7 @@ class DisputeRepository {
 
   DisputeRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   /// All cancelled orders; the view model splits them into open/resolved.
   Stream<List<FoodOrder>> watchCancelledOrders() {

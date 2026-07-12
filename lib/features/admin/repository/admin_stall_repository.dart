@@ -11,7 +11,7 @@ class AdminStallRepository {
 
   AdminStallRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   CollectionReference<Map<String, dynamic>> get _stalls =>
       _db.collection(AppConstants.stallsCollection);

@@ -13,7 +13,7 @@ class WalletRepository {
 
   WalletRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   DocumentReference<Map<String, dynamic>> _userRef(String uid) =>
       _db.collection(AppConstants.usersCollection).doc(uid);

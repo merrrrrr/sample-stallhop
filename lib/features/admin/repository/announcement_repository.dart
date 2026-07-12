@@ -10,7 +10,7 @@ class AnnouncementRepository {
 
   AnnouncementRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   Stream<List<Announcement>> watchAnnouncements() {
     return _firestore

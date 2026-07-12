@@ -13,7 +13,7 @@ class ReviewRepository {
 
   ReviewRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   CollectionReference<Map<String, dynamic>> get _reviews =>
       _db.collection(AppConstants.reviewsCollection);

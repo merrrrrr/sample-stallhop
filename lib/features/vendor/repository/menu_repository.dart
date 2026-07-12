@@ -11,7 +11,7 @@ class MenuRepository {
 
   MenuRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   String _path(String stallId) =>
       '${AppConstants.stallsCollection}/$stallId/'
