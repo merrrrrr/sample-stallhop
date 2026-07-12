@@ -16,11 +16,18 @@ class OrderQueueViewModel extends ChangeNotifier {
 
   OrderQueueViewModel(String vendorUid, {VendorOrderRepository? repository})
       : _repository = repository ?? VendorOrderRepository() {
-    _sub = _repository.watchActiveOrders(vendorUid).listen((orders) {
-      _orders = orders;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.watchActiveOrders(vendorUid).listen(
+      (orders) {
+        _orders = orders;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('OrderQueueViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   bool get isLoading => _loading;

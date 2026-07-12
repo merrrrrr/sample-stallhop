@@ -18,11 +18,18 @@ class OrderTrackingViewModel extends ChangeNotifier {
 
   OrderTrackingViewModel(String orderId, {OrderRepository? repository})
       : _repository = repository ?? OrderRepository() {
-    _sub = _repository.listenToOrder(orderId).listen((order) {
-      _order = order;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.listenToOrder(orderId).listen(
+      (order) {
+        _order = order;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('OrderTrackingViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   @override

@@ -15,11 +15,18 @@ class DisputesViewModel extends ChangeNotifier {
 
   DisputesViewModel({DisputeRepository? repository})
       : _repository = repository ?? DisputeRepository() {
-    _sub = _repository.watchCancelledOrders().listen((orders) {
-      _cancelled = orders;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.watchCancelledOrders().listen(
+      (orders) {
+        _cancelled = orders;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('DisputesViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   bool get isLoading => _loading;

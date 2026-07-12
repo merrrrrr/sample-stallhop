@@ -63,18 +63,29 @@ class AuthViewModel extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    _userSub = _authRepository.watchUser(fbUser.uid).listen((appUser) {
-      _currentUser = appUser;
-      if (appUser != null) {
-        _status = AuthStatus.authenticated;
+    _userSub = _authRepository.watchUser(fbUser.uid).listen(
+      (appUser) {
+        _currentUser = appUser;
+        if (appUser != null) {
+          _status = AuthStatus.authenticated;
+          _suppressRolePrompt = false;
+        } else {
+          _status = _suppressRolePrompt
+              ? AuthStatus.unknown
+              : AuthStatus.needsRoleSelection;
+        }
+        notifyListeners();
+      },
+      onError: (Object e) {
+        // Without this the app wedges on the splash screen with an unhandled
+        // stream error if the user document can't be read.
+        debugPrint('AuthViewModel user stream error: $e');
         _suppressRolePrompt = false;
-      } else {
-        _status = _suppressRolePrompt
-            ? AuthStatus.unknown
-            : AuthStatus.needsRoleSelection;
-      }
-      notifyListeners();
-    });
+        _error = 'Could not load your profile. Please try again.';
+        _status = AuthStatus.unauthenticated;
+        notifyListeners();
+      },
+    );
   }
 
   Future<bool> login(String email, String password) async {

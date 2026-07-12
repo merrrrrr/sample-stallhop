@@ -25,15 +25,27 @@ class VendorDashboardViewModel extends ChangeNotifier {
     this.vendorUid, {
     VendorOrderRepository? repository,
   }) : _repository = repository ?? VendorOrderRepository() {
-    _stallSub = _repository.watchMyStall(vendorUid).listen((stall) {
-      _stall = stall;
-      _loadingStall = false;
-      notifyListeners();
-    });
-    _ordersSub = _repository.watchAllOrders(vendorUid).listen((orders) {
-      _orders = orders;
-      notifyListeners();
-    });
+    _stallSub = _repository.watchMyStall(vendorUid).listen(
+      (stall) {
+        _stall = stall;
+        _loadingStall = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorDashboardViewModel stall stream error: $e');
+        _loadingStall = false;
+        notifyListeners();
+      },
+    );
+    _ordersSub = _repository.watchAllOrders(vendorUid).listen(
+      (orders) {
+        _orders = orders;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorDashboardViewModel orders stream error: $e');
+      },
+    );
   }
 
   Stall? get stall => _stall;

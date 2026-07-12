@@ -16,11 +16,18 @@ class VendorManagementViewModel extends ChangeNotifier {
 
   VendorManagementViewModel({AdminStallRepository? repository})
       : _repository = repository ?? AdminStallRepository() {
-    _sub = _repository.watchAllStalls().listen((stalls) {
-      _stalls = stalls;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.watchAllStalls().listen(
+      (stalls) {
+        _stalls = stalls;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorManagementViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   bool get isLoading => _loading;

@@ -18,11 +18,18 @@ class VendorOrderDetailViewModel extends ChangeNotifier {
 
   VendorOrderDetailViewModel(String orderId, {VendorOrderRepository? repository})
       : _repository = repository ?? VendorOrderRepository() {
-    _sub = _repository.listenToOrder(orderId).listen((order) {
-      _order = order;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.listenToOrder(orderId).listen(
+      (order) {
+        _order = order;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorOrderDetailViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   Future<void> markReady(String orderId) => _repository.markReady(orderId);

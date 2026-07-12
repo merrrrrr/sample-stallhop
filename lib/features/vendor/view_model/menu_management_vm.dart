@@ -16,11 +16,18 @@ class MenuManagementViewModel extends ChangeNotifier {
 
   MenuManagementViewModel(this.stallId, {MenuRepository? repository})
       : _repository = repository ?? MenuRepository() {
-    _sub = _repository.watchMenuItems(stallId).listen((items) {
-      _items = items;
-      _loading = false;
-      notifyListeners();
-    });
+    _sub = _repository.watchMenuItems(stallId).listen(
+      (items) {
+        _items = items;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('MenuManagementViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
   List<MenuItem> get items => _items;

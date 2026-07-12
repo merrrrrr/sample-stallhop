@@ -31,15 +31,27 @@ class AdminDashboardViewModel extends ChangeNotifier {
         _stallRepository = stallRepository ?? AdminStallRepository() {
     _ordersSub = _firestore
         .collectionStream(AppConstants.ordersCollection)
-        .listen((rows) {
-      _orders = rows.map(FoodOrder.fromJson).toList();
-      _loading = false;
-      notifyListeners();
-    });
-    _stallsSub = _stallRepository.watchAllStalls().listen((stalls) {
-      _stalls = stalls;
-      notifyListeners();
-    });
+        .listen(
+      (rows) {
+        _orders = rows.map(FoodOrder.fromJson).toList();
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('AdminDashboardViewModel orders stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
+    _stallsSub = _stallRepository.watchAllStalls().listen(
+      (stalls) {
+        _stalls = stalls;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('AdminDashboardViewModel stalls stream error: $e');
+      },
+    );
   }
 
   bool get isLoading => _loading;
