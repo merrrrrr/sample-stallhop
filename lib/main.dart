@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'core/routing/app_router.dart';
+import 'core/services/notification_coordinator.dart';
+import 'core/services/notification_service.dart';
 import 'core/theme/app_colors.dart';
 import 'core/theme/app_theme.dart';
 import 'core/utils/constants.dart';
@@ -17,10 +19,23 @@ Future<void> main() async {
   await Firebase.initializeApp(
     options: DefaultFirebaseOptions.currentPlatform,
   );
+
+  final notificationService = NotificationService();
+  await notificationService.init();
+
+  // In-app notifications follow the signed-in user: listeners start on
+  // login and stop on logout (see NotificationCoordinator).
+  final authViewModel = AuthViewModel();
+  final notificationCoordinator =
+      NotificationCoordinator(notifications: notificationService);
+  authViewModel.addListener(
+    () => notificationCoordinator.sync(authViewModel.currentUser),
+  );
+
   runApp(
     MultiProvider(
       providers: [
-        ChangeNotifierProvider(create: (_) => AuthViewModel()),
+        ChangeNotifierProvider.value(value: authViewModel),
         ChangeNotifierProvider(create: (_) => CartViewModel()),
       ],
       child: const StallHopApp(),

@@ -18,7 +18,7 @@ class OrderRepository {
 
   OrderRepository({FirebaseFirestore? db, FirestoreService? firestore})
       : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService();
+        _firestore = firestore ?? FirestoreService(db: db);
 
   CollectionReference<Map<String, dynamic>> get _orders =>
       _db.collection(AppConstants.ordersCollection);
@@ -57,9 +57,17 @@ class OrderRepository {
       if (custBefore < total) throw const InsufficientBalanceException();
       final vendBefore = (vendorSnap.data()?['walletBalance'] ?? 0) as int;
 
-      final prefix =
-          (venueSnap.data()?['pickupCodePrefix'] ?? 'A') as String;
-      final counter = (venueSnap.data()?['pickupCodeCounter'] ?? 0) as int;
+      // Pickup codes restart each day (replaces the plan's scheduled
+      // resetPickupCodeDaily Cloud Function — automation is client-side).
+      final todayKey = _dateKey(now);
+      final storedDate = venueSnap.data()?['pickupCodeDate'] as String?;
+      final isNewDay = storedDate != todayKey;
+      final prefix = isNewDay
+          ? 'A'
+          : (venueSnap.data()?['pickupCodePrefix'] ?? 'A') as String;
+      final counter = isNewDay
+          ? 0
+          : (venueSnap.data()?['pickupCodeCounter'] ?? 0) as int;
       final nextCounter = counter + 1;
       final pickupCode = '$prefix${nextCounter.toString().padLeft(3, '0')}';
 
@@ -96,15 +104,12 @@ class OrderRepository {
         'walletBalance': vendAfter,
         'updatedAt': Timestamp.fromDate(now),
       });
-      if (venueSnap.exists) {
-        txn.update(_venueRef, {'pickupCodeCounter': nextCounter});
-      } else {
-        txn.set(_venueRef, {
-          'pickupCodePrefix': prefix,
-          'pickupCodeCounter': nextCounter,
-          'updatedAt': Timestamp.fromDate(now),
-        }, SetOptions(merge: true));
-      }
+      txn.set(_venueRef, {
+        'pickupCodePrefix': prefix,
+        'pickupCodeCounter': nextCounter,
+        'pickupCodeDate': todayKey,
+        'updatedAt': Timestamp.fromDate(now),
+      }, SetOptions(merge: true));
 
       _writeTxn(
         txn,
@@ -187,6 +192,13 @@ class OrderRepository {
       );
     });
   }
+
+  /// Calendar-day key (`yyyy-MM-dd`) used to detect when the pickup-code
+  /// counter should reset.
+  static String _dateKey(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-'
+      '${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
 
   // Commission isn't stored on the order; derive the vendor's earning share
   // from total/subtotal so the reversal matches the original earning credit.
