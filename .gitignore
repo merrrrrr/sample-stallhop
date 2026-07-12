@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+StallHop_Implementation_Plan.html
+StallHop_Technical_Specification.html
