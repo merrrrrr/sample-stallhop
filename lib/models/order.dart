@@ -17,6 +17,16 @@ class FoodOrder {
   final int subtotal; // cents
   final int serviceFee; // cents
   final int total; // cents
+
+  /// Commission rate actually applied when this order was placed
+  /// (`stall.commissionRate ?? venueConfig.defaultCommission`). Stored so a
+  /// refund reverses at the rate charged at the time, not today's rate.
+  final double commissionRate;
+
+  /// Cents credited to the vendor at placement. Stored alongside the rate so
+  /// the reversal is guaranteed to equal the original credit exactly.
+  final int vendorEarning;
+
   final String status;
   final String pickupCode;
   final bool refunded;
@@ -42,6 +52,8 @@ class FoodOrder {
     required this.subtotal,
     required this.serviceFee,
     required this.total,
+    this.commissionRate = 0.0,
+    this.vendorEarning = 0,
     this.status = 'preparing',
     required this.pickupCode,
     this.refunded = false,
@@ -72,6 +84,8 @@ class FoodOrder {
       subtotal: (json['subtotal'] ?? 0) as int,
       serviceFee: (json['serviceFee'] ?? 0) as int,
       total: (json['total'] ?? 0) as int,
+      commissionRate: (json['commissionRate'] ?? 0.10).toDouble(),
+      vendorEarning: (json['vendorEarning'] ?? 0) as int,
       status: json['status'] ?? 'preparing',
       pickupCode: json['pickupCode'] ?? '',
       refunded: json['refunded'] ?? false,
@@ -95,6 +109,8 @@ class FoodOrder {
         'subtotal': subtotal,
         'serviceFee': serviceFee,
         'total': total,
+        'commissionRate': commissionRate,
+        'vendorEarning': vendorEarning,
         'status': status,
         'pickupCode': pickupCode,
         'refunded': refunded,
@@ -128,6 +144,8 @@ class FoodOrder {
       subtotal: subtotal,
       serviceFee: serviceFee,
       total: total,
+      commissionRate: commissionRate,
+      vendorEarning: vendorEarning,
       status: status ?? this.status,
       pickupCode: pickupCode,
       refunded: refunded ?? this.refunded,

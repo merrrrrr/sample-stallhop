@@ -73,13 +73,8 @@ class VendorDashboardViewModel extends ChangeNotifier {
   int get todayOrderCount => _todayOrders.length;
 
   /// Today's gross earnings for this vendor (subtotal minus commission), cents.
-  int get todayEarnings {
-    final rate = _stall?.commissionRate ?? AppConstants.defaultCommissionRate;
-    return _todayOrders.fold(
-      0,
-      (acc, o) => acc + (o.subtotal * (1 - rate)).round(),
-    );
-  }
+  int get todayEarnings =>
+      _todayOrders.fold(0, (acc, o) => acc + o.vendorEarning);
 
   Future<void> toggleOpen(bool open) async {
     final stall = _stall;

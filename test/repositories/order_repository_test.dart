@@ -94,8 +94,39 @@ void main() {
       final vend = await db.collection('users').doc('vend1').get();
       // total = 700 subtotal + 50 service fee
       expect(cust.data()!['walletBalance'], 10000 - 750);
-      // vendor gets subtotal minus 10% commission
-      expect(vend.data()!['walletBalance'], 630);
+      // no stall override and no venue doc, so the 10% default applies
+      expect(vend.data()!['walletBalance'], 700 - 70);
+    });
+
+    test('a null stall rate inherits the venue default', () async {
+      await db.collection('config').doc('venue').set({
+        'defaultCommission': 0.15,
+      });
+
+      final order = await repo.placeOrder(
+          customer: customer, stall: stall, items: items);
+
+      final vend = await db.collection('users').doc('vend1').get();
+      expect(vend.data()!['walletBalance'], 700 - 105);
+      expect(order.commissionRate, 0.15);
+      expect(order.vendorEarning, 700 - 105);
+    });
+
+    test('an explicit stall rate overrides the venue default', () async {
+      await db.collection('config').doc('venue').set({
+        'defaultCommission': 0.15,
+      });
+
+      final order = await repo.placeOrder(
+        customer: customer,
+        stall: stall.copyWith(commissionRate: 0.05),
+        items: items,
+      );
+
+      final vend = await db.collection('users').doc('vend1').get();
+      expect(vend.data()!['walletBalance'], 700 - 35);
+      expect(order.commissionRate, 0.05);
+      expect(order.vendorEarning, 700 - 35);
     });
 
     test('cancelAndRefund restores customer and claws back vendor', () async {
@@ -111,6 +142,38 @@ void main() {
       final stored = await db.collection('orders').doc(order.orderId).get();
       expect(stored.data()!['status'], 'cancelled');
       expect(stored.data()!['refunded'], true);
+    });
+
+    test('refund at a non-default rate returns both wallets to par', () async {
+      await db.collection('config').doc('venue').set({
+        'defaultCommission': 0.15,
+      });
+
+      final order = await repo.placeOrder(
+        customer: customer,
+        stall: stall.copyWith(commissionRate: 0.05),
+        items: items,
+      );
+      await repo.cancelAndRefund(order);
+
+      // Reversing the stored vendorEarning rather than recomputing at a
+      // hardcoded 10% is what keeps these exact.
+      final cust = await db.collection('users').doc('cust1').get();
+      final vend = await db.collection('users').doc('vend1').get();
+      expect(cust.data()!['walletBalance'], 10000);
+      expect(vend.data()!['walletBalance'], 0);
+    });
+
+    test('cancelAndRefund is idempotent', () async {
+      final order = await repo.placeOrder(
+          customer: customer, stall: stall, items: items);
+      await repo.cancelAndRefund(order);
+      await repo.cancelAndRefund(order.copyWith(refunded: true));
+
+      final cust = await db.collection('users').doc('cust1').get();
+      final vend = await db.collection('users').doc('vend1').get();
+      expect(cust.data()!['walletBalance'], 10000);
+      expect(vend.data()!['walletBalance'], 0);
     });
   });
 }

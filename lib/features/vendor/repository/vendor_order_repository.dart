@@ -62,7 +62,6 @@ class VendorOrderRepository {
       description: description,
       status: AppConstants.stallPending,
       prepTimeMinutes: prepTimeMinutes,
-      commissionRate: AppConstants.defaultCommissionRate,
       createdAt: now,
       updatedAt: now,
     );

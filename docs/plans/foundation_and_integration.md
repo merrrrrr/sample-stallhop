@@ -455,12 +455,14 @@ role's folders:
   `DisputesViewModel` open vs resolved. Widget: dashboard KPI tiles render
   formatted currency; disputes page shows the empty state.
 
-Two pre-existing test defects to clean up (Mervin, they're in his files):
-- `test/models/models_test.dart:160` — the comment says "a fresh order defaults
-  both flags to false" but the assertion is `isTrue`. The comment is wrong;
-  make them agree.
-- `order_repository_test.dart` — the `630` literal should be derived from a
-  named constant so the intent is legible.
+Two pre-existing test defects, both now fixed (Mervin, they were in his files):
+- `test/models/models_test.dart` — the comment said "a fresh order defaults
+  both flags to false" but the assertion was `isTrue`. The assertion was the
+  correct one: `copyWith()` preserves the flags. The comment now says so, and
+  a separate `a fresh order defaults to an open dispute` case covers what the
+  old comment was actually reaching for.
+- `order_repository_test.dart` — the bare `630` is now `700 - 70`, matching
+  the derivation style of the `10000 - 750` assertion above it.
 
 ---
 

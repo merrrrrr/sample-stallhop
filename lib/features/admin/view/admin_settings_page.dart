@@ -6,7 +6,7 @@ import '../../../core/theme/app_text_styles.dart';
 import '../../../core/utils/formatters.dart';
 import '../../../models/venue_config.dart';
 import '../../auth/view_model/auth_view_model.dart';
-import '../repository/venue_config_repository.dart';
+import '../../../core/repository/venue_config_repository.dart';
 import 'announcements_page.dart';
 
 class AdminSettingsPage extends StatefulWidget {

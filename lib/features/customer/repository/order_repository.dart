@@ -71,8 +71,11 @@ class OrderRepository {
       final nextCounter = counter + 1;
       final pickupCode = '$prefix${nextCounter.toString().padLeft(3, '0')}';
 
-      final vendorEarning =
-          (subtotal * (1 - stall.commissionRate)).round();
+      final venueRate = (venueSnap.data()?['defaultCommission'] ??
+              AppConstants.defaultCommissionRate)
+          .toDouble();
+      final rate = stall.commissionRate ?? venueRate;
+      final vendorEarning = (subtotal * (1 - rate)).round();
       final custAfter = custBefore - total;
       final vendAfter = vendBefore + vendorEarning;
 
@@ -88,6 +91,8 @@ class OrderRepository {
         subtotal: subtotal,
         serviceFee: serviceFeeCents,
         total: total,
+        commissionRate: rate,
+        vendorEarning: vendorEarning,
         status: AppConstants.orderPreparing,
         pickupCode: pickupCode,
         createdAt: now,
@@ -151,8 +156,7 @@ class OrderRepository {
 
       final custBefore = (customerSnap.data()?['walletBalance'] ?? 0) as int;
       final vendBefore = (vendorSnap.data()?['walletBalance'] ?? 0) as int;
-      final vendorEarning =
-          (order.subtotal * (1 - _commissionFor(order))).round();
+      final vendorEarning = order.vendorEarning;
       final custAfter = custBefore + order.total;
       final vendAfter = vendBefore - vendorEarning;
 
@@ -199,13 +203,6 @@ class OrderRepository {
       '${d.year.toString().padLeft(4, '0')}-'
       '${d.month.toString().padLeft(2, '0')}-'
       '${d.day.toString().padLeft(2, '0')}';
-
-  // Commission isn't stored on the order; derive the vendor's earning share
-  // from total/subtotal so the reversal matches the original earning credit.
-  double _commissionFor(FoodOrder order) {
-    if (order.subtotal == 0) return 0;
-    return AppConstants.defaultCommissionRate;
-  }
 
   void _writeTxn(
     Transaction txn, {

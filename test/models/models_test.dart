@@ -67,6 +67,53 @@ void main() {
     );
   });
 
+  test('Stall round-trips a null commissionRate as null', () {
+    final stall = Stall(
+      stallId: 's2',
+      vendorUid: 'v1',
+      name: 'Inherits The Default',
+      createdAt: now,
+      updatedAt: later,
+    );
+    expect(stall.commissionRate, isNull);
+    final back = Stall.fromJson(stall.toJson());
+    expect(back.commissionRate, isNull,
+        reason: 'null means "inherit the venue default" and must not be '
+            'coerced to a concrete rate on the way back');
+    expectRoundTrip(stall.toJson(), back.toJson());
+  });
+
+  test('Stall.fromJson treats a missing commissionRate as inherit', () {
+    final json = Stall(
+      stallId: 's3',
+      vendorUid: 'v1',
+      name: 'No Rate Key',
+      createdAt: now,
+      updatedAt: later,
+    ).toJson()
+      ..remove('commissionRate');
+    expect(Stall.fromJson(json).commissionRate, isNull);
+  });
+
+  test('Stall.copyWith preserves an override but clears it on request', () {
+    final overridden = Stall(
+      stallId: 's4',
+      vendorUid: 'v1',
+      name: 'Negotiated Rate',
+      commissionRate: 0.05,
+      createdAt: now,
+      updatedAt: later,
+    );
+
+    expect(overridden.copyWith(name: 'Renamed').commissionRate, 0.05);
+    expect(overridden.copyWith(commissionRate: null).commissionRate, 0.05,
+        reason: 'passing null cannot mean "clear" — it is indistinguishable '
+            'from "leave unchanged"');
+    expect(overridden.copyWith(commissionRate: 0.20).commissionRate, 0.20);
+    expect(overridden.copyWith(clearCommissionRate: true).commissionRate,
+        isNull);
+  });
+
   test('MenuItem round-trips with customizations and add-ons', () {
     final item = MenuItem(
       itemId: 'i1',
@@ -137,6 +184,8 @@ void main() {
       subtotal: 950,
       serviceFee: 50,
       total: 1000,
+      commissionRate: 0.15,
+      vendorEarning: 808,
       status: 'preparing',
       pickupCode: 'A001',
       refunded: false,
@@ -173,9 +222,61 @@ void main() {
     expect(back.refunded, isTrue);
     expect(back.dismissed, isTrue);
     expect(back.cancelledAt, later);
-    // A fresh order defaults both flags to false (an "open dispute" once
-    // cancelled).
+    // An argument-less copyWith preserves both flags rather than resetting
+    // them to their constructor defaults.
+    expect(FoodOrder.fromJson(order.copyWith().toJson()).refunded, isTrue);
     expect(FoodOrder.fromJson(order.copyWith().toJson()).dismissed, isTrue);
+  });
+
+  test('FoodOrder carries the applied rate and earning through copyWith', () {
+    final order = FoodOrder(
+      orderId: 'o4',
+      customerUid: 'u1',
+      customerName: 'Alice',
+      stallId: 's1',
+      vendorUid: 'v1',
+      stallName: 'Nasi Lemak Corner',
+      subtotal: 1000,
+      serviceFee: 50,
+      total: 1050,
+      commissionRate: 0.15,
+      vendorEarning: 850,
+      pickupCode: 'A004',
+      createdAt: now,
+      updatedAt: now,
+    );
+
+    final back = FoodOrder.fromJson(order.toJson());
+    expect(back.commissionRate, 0.15);
+    expect(back.vendorEarning, 850);
+
+    // Both must survive a status transition, because cancelAndRefund reverses
+    // the stored earning long after placement.
+    final cancelled = order.copyWith(status: 'cancelled', refunded: true);
+    expect(cancelled.commissionRate, 0.15);
+    expect(cancelled.vendorEarning, 850);
+  });
+
+  test('a fresh order defaults to an open dispute', () {
+    final order = FoodOrder(
+      orderId: 'o3',
+      customerUid: 'u1',
+      customerName: 'Alice',
+      stallId: 's1',
+      vendorUid: 'v1',
+      stallName: 'Nasi Lemak Corner',
+      subtotal: 950,
+      serviceFee: 50,
+      total: 1000,
+      pickupCode: 'A003',
+      createdAt: now,
+      updatedAt: now,
+    );
+    expect(order.refunded, isFalse);
+    expect(order.dismissed, isFalse);
+    final back = FoodOrder.fromJson(order.toJson());
+    expect(back.refunded, isFalse);
+    expect(back.dismissed, isFalse);
   });
 
   test('WalletTransaction round-trips', () {

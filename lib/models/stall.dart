@@ -14,7 +14,13 @@ class Stall {
   final int prepTimeMinutes;
   final double averageRating;
   final int totalReviews;
-  final double commissionRate;
+
+  /// Per-stall commission override. `null` means "inherit the venue-wide
+  /// default" (`config/venue.defaultCommission`), which is what makes the
+  /// admin's commission setting actually reach pricing. Only an admin may
+  /// write this field.
+  final double? commissionRate;
+
   final double? latitude;
   final double? longitude;
   final DateTime createdAt;
@@ -31,7 +37,7 @@ class Stall {
     this.prepTimeMinutes = 15,
     this.averageRating = 0.0,
     this.totalReviews = 0,
-    this.commissionRate = 0.10,
+    this.commissionRate,
     this.latitude,
     this.longitude,
     required this.createdAt,
@@ -52,7 +58,9 @@ class Stall {
       prepTimeMinutes: (json['prepTimeMinutes'] ?? 15) as int,
       averageRating: (json['averageRating'] ?? 0).toDouble(),
       totalReviews: (json['totalReviews'] ?? 0) as int,
-      commissionRate: (json['commissionRate'] ?? 0.10).toDouble(),
+      // Deliberately NOT defaulted to 0.10 — a missing/null value means
+      // "inherit the venue default", so it must survive the round trip.
+      commissionRate: (json['commissionRate'] as num?)?.toDouble(),
       latitude: (json['latitude'] as num?)?.toDouble(),
       longitude: (json['longitude'] as num?)?.toDouble(),
       createdAt: (json['createdAt'] as Timestamp).toDate(),
@@ -78,6 +86,10 @@ class Stall {
         'updatedAt': Timestamp.fromDate(updatedAt),
       };
 
+  /// Note [clearCommissionRate]: because `null` is a meaningful value here,
+  /// `copyWith(commissionRate: null)` cannot mean "clear it" — that is
+  /// indistinguishable from "don't change it". Pass `clearCommissionRate: true`
+  /// to reset a stall back to inheriting the venue default.
   Stall copyWith({
     String? name,
     String? description,
@@ -88,6 +100,7 @@ class Stall {
     double? averageRating,
     int? totalReviews,
     double? commissionRate,
+    bool clearCommissionRate = false,
     double? latitude,
     double? longitude,
     DateTime? updatedAt,
@@ -103,7 +116,8 @@ class Stall {
       prepTimeMinutes: prepTimeMinutes ?? this.prepTimeMinutes,
       averageRating: averageRating ?? this.averageRating,
       totalReviews: totalReviews ?? this.totalReviews,
-      commissionRate: commissionRate ?? this.commissionRate,
+      commissionRate:
+          clearCommissionRate ? null : (commissionRate ?? this.commissionRate),
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
       createdAt: createdAt,
