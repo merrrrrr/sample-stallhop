@@ -4710,6 +4710,57 @@ Justin's approve/suspend actions. Plus `getStall`, `watchStall`,
 `getMenuItems(stallId)`, `watchMenuItems(stallId)` on the
 `stalls/{stallId}/menuItems` subcollection.
 
+### Code for §1.1
+
+Every method is the same two lines — query, then map through `fromJson`. The
+only parts worth writing out are the path helpers and the visibility filter:
+
+```dart
+class StallRepository {
+  final FirestoreService _firestore;
+
+  StallRepository({FirestoreService? firestore})
+      : _firestore = firestore ?? FirestoreService();
+
+  String get _col => AppConstants.stallsCollection;
+
+  String _menuPath(String stallId) =>
+      '$_col/$stallId/${AppConstants.menuItemsSubcollection}';
+
+  /// Streams stalls visible to customers (open or temporarily closed, but not
+  /// pending/suspended/rejected).
+  Stream<List<Stall>> watchVisibleStalls() {
+    return _firestore
+        .collectionStream(
+          _col,
+          query: (q) => q.where(
+            'status',
+            whereIn: [AppConstants.stallOpen, AppConstants.stallClosed],
+          ),
+        )
+        .map((rows) => rows.map(Stall.fromJson).toList());
+  }
+}
+```
+
+⚠️ The `whereIn` list is the *entire* mechanism behind Justin's approve and
+suspend buttons — he never deletes anything, he just moves a stall out of
+those two statuses. Repeat the same filter in `getVisibleStalls()` (one-shot,
+`getCollection` instead of `collectionStream`). The remaining four methods:
+
+```dart
+Stream<Stall?> watchStall(String stallId) => _firestore
+    .documentStream('$_col/$stallId')
+    .map((data) => data == null ? null : Stall.fromJson(data));
+
+Stream<List<MenuItem>> watchMenuItems(String stallId) => _firestore
+    .collectionStream(_menuPath(stallId))
+    .map((rows) => rows.map(MenuItem.fromJson).toList());
+```
+
+`getStall` and `getMenuItems` are the `getDocument` / `getCollection`
+equivalents of those two.
+
 ## 1.2 `StallBrowsingViewModel` + home/browse screens (~6 h)
 `stall_browsing_vm.dart`. Holds `_all`, `_loading`, `_error`, `_search`,
 `_cuisine`, `_sort` (`enum StallSort { rating, prepTime, name }`). The
@@ -4725,6 +4776,113 @@ filter chips from the data.
 - [ ] `stall_browsing_page.dart` — search field, cuisine `FilterChip` row, sort
       menu, `ListView` of `StallCard`, empty state when filters match nothing.
 
+### Code for §1.2
+
+**The `stalls` getter** is the only non-obvious part of the view model — the
+two-pass sort the bullet above asks you to defend:
+
+```dart
+List<Stall> get stalls {
+  var list = _all.where((s) {
+    final matchesSearch = _search.isEmpty ||
+        s.name.toLowerCase().contains(_search.toLowerCase());
+    final matchesCuisine = _cuisine == null || s.cuisine == _cuisine;
+    return matchesSearch && matchesCuisine;
+  }).toList();
+
+  switch (_sort) {
+    case StallSort.rating:
+      list.sort((a, b) => b.averageRating.compareTo(a.averageRating));
+    case StallSort.prepTime:
+      list.sort((a, b) => a.prepTimeMinutes.compareTo(b.prepTimeMinutes));
+    case StallSort.name:
+      list.sort((a, b) => a.name.compareTo(b.name));
+  }
+  // Show open stalls before closed ones regardless of sort.
+  list.sort((a, b) {
+    final ao = a.status == AppConstants.stallOpen ? 0 : 1;
+    final bo = b.status == AppConstants.stallOpen ? 0 : 1;
+    return ao.compareTo(bo);
+  });
+  return list;
+}
+```
+
+⚠️ **Why two sorts and not one compound comparator:** Dart's `List.sort` is
+stable, so the second pass partitions open-before-closed while preserving the
+ordering the first pass established *within* each group. A compound comparator
+would work too, but you'd have to rewrite it for every new sort mode — this
+way each mode stays a single line and the open-first rule is expressed once.
+Know this answer; the two-sort pattern looks like a mistake to a reader who
+doesn't know `sort` is stable.
+
+The rest of the class is the standard stream-subscription shape used
+throughout Phase 0 — `_listen()` in the constructor with an `onError` that
+sets `_error = 'Could not load stalls.'` and clears `_loading`, three
+`setX` mutators that just assign and `notifyListeners()`, a `cuisines` getter
+that collects `s.cuisine` into a `Set` and sorts it for the filter chips, and
+`dispose()` cancelling the subscription.
+
+**`customer_home_page.dart`** — an `IndexedStack`, not a swapped child, so
+each tab keeps its scroll position and state across switches:
+
+```dart
+static const _pages = [
+  StallBrowsingPage(),
+  OrdersListPage(),
+  WalletPage(),
+  CustomerProfilePage(),
+];
+
+@override
+Widget build(BuildContext context) {
+  final cartCount = context.watch<CartViewModel>().totalItemCount;
+  return Scaffold(
+    body: IndexedStack(index: _index, children: _pages),
+    floatingActionButton: (_index == 0 && cartCount > 0)
+        ? FloatingActionButton.extended(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const CartPage()),
+            ),
+            icon: const Icon(Icons.shopping_cart),
+            label: Text('$cartCount'),
+          )
+        : null,
+    bottomNavigationBar: NavigationBar(
+      selectedIndex: _index,
+      onDestinationSelected: (i) => setState(() => _index = i),
+      destinations: const [/* Home, Orders, Wallet, Profile */],
+    ),
+  );
+}
+```
+
+The cart FAB only appears on the Home tab and only when the cart is non-empty,
+so it never covers the Orders or Wallet lists. `totalItemCount` comes from the
+app-wide `CartViewModel` (§1.4), which is why that provider lives at the root
+in `main.dart` rather than here.
+
+**`stall_browsing_page.dart`** — `ChangeNotifierProvider` creating the view
+model, wrapping a private `_StallBrowsingView` that does
+`context.watch<StallBrowsingViewModel>()`. Split the body into private
+`_Header`, `_FilterRow` and `_StallList` widgets. The list has three states in
+this order:
+
+```dart
+if (vm.isLoading) return const LoadingIndicator();
+if (vm.error != null) return EmptyState(title: vm.error!, icon: Icons.error_outline);
+if (vm.stalls.isEmpty) {
+  return const EmptyState(
+    title: 'No stalls match',
+    message: 'Try clearing the search or cuisine filter.',
+  );
+}
+return ListView.builder(/* StallCard per stall, onTap pushes StallMenuPage */);
+```
+
+The cuisine row is a leading `FilterChip('All')` with
+`selected: vm.cuisine == null`, then one chip per `vm.cuisines` entry.
+
 ## 1.3 `stall_menu_page.dart` + `item_detail_page.dart` (~7 h)
 - [ ] Menu page: stall header (image, rating, prep time, open/closed), menu
       items grouped by `category`, unavailable items visibly disabled.
@@ -4733,6 +4891,107 @@ filter chips from the data.
       stepper, special-instructions field, and a **live-updating total** —
       `(price + selected add-ons) × quantity`. Builds an `OrderItem` and calls
       `cart.addItem(stall, item)`.
+
+### Code for §1.3
+
+**`stall_menu_page.dart`** is a header plus a grouped list, structurally the
+same as `menu_management_page.dart` that Yong Jun builds. The one rule:
+
+```dart
+// Unavailable items stay visible but are not tappable — a customer should see
+// that the stall sells the dish and that it is off today, not think it never
+// existed.
+final available = item.available && stall.isOpen;
+return Opacity(
+  opacity: available ? 1.0 : 0.4,
+  child: ListTile(
+    onTap: available
+        ? () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => ItemDetailPage(stall: stall, item: item),
+            ))
+        : null,
+    /* thumbnail, name, centsToRM(item.price) */
+  ),
+);
+```
+
+**`item_detail_page.dart`** — a `StatefulWidget`; all selection state is local
+`setState` state, because none of it means anything until "add to cart".
+
+```dart
+final Map<String, String> _selectedCustomizations = {};
+final Set<int> _selectedAddOns = {};   // indices into item.addOns
+final _instructionsController = TextEditingController();
+int _quantity = 1;
+
+@override
+void initState() {
+  super.initState();
+  // Default each customization group to its first option.
+  for (final group in widget.item.customizations) {
+    final name = group['name'] as String?;
+    final options = (group['options'] as List?)?.cast<dynamic>();
+    if (name != null && options != null && options.isNotEmpty) {
+      _selectedCustomizations[name] = options.first.toString();
+    }
+  }
+}
+```
+
+Defaulting each group in `initState` is what makes the groups genuinely
+single-select — there is no "nothing chosen" state to handle at save time.
+
+The live total is three derived getters, recomputed on every `setState`:
+
+```dart
+int get _addOnsTotal {
+  var total = 0;
+  for (final idx in _selectedAddOns) {
+    if (idx < widget.item.addOns.length) {
+      total += ((widget.item.addOns[idx]['price'] ?? 0) as num).toInt();
+    }
+  }
+  return total;
+}
+
+int get _unitPrice => widget.item.price + _addOnsTotal;
+int get _lineTotal => _unitPrice * _quantity;
+```
+
+⚠️ **The trap in `_addToCart`:** the `OrderItem` you build stores
+`unitPrice: widget.item.price` — the **base** price, *without* add-ons — and
+keeps the chosen add-ons in its own `addOns` list. `_unitPrice` above is for
+the button label only. `OrderItem.subtotal` re-adds the add-ons itself
+(`(unitPrice + addOns) × quantity`, §0.3), so passing `_unitPrice` here would
+charge every add-on **twice**. This is the single easiest way to corrupt the
+money path from the UI side.
+
+```dart
+void _addToCart() {
+  final addOns = <Map<String, dynamic>>[];
+  for (final idx in _selectedAddOns) {
+    final a = widget.item.addOns[idx];
+    addOns.add({'name': a['name'], 'price': a['price']});
+  }
+  final orderItem = OrderItem(
+    itemId: widget.item.itemId,
+    name: widget.item.name,
+    unitPrice: widget.item.price,        // base price — NOT _unitPrice
+    quantity: _quantity,
+    customizations: Map<String, dynamic>.from(_selectedCustomizations),
+    addOns: addOns,
+    specialInstructions: _instructionsController.text.trim(),
+  );
+  context.read<CartViewModel>().addItem(widget.stall, orderItem);
+  Navigator.of(context).pop();
+}
+```
+
+Render the customization groups as a `Wrap` of `ChoiceChip`s (one private
+`_CustomizationGroup` widget) and the add-ons as `CheckboxListTile`s keyed by
+index. The button label carries the live figure:
+`Text('Add to cart • ${centsToRM(_lineTotal)}')`. Don't forget
+`_instructionsController.dispose()`.
 
 ## 1.4 `CartViewModel` (~4 h) — app-wide provider
 `cart_vm.dart`. Provided at the root in `main.dart` so the cart survives
@@ -4754,6 +5013,112 @@ the stall entirely), `clearStall`, `clear`. Getters: `getSubtotal(stallId)`,
 - [ ] `test/view_models/cart_vm_test.dart` — merging identical lines, keeping
       distinct lines when add-ons differ, decrement-to-zero removal,
       multi-stall grouping and per-group service fees.
+
+### Code for §1.4
+
+Two parallel maps, both keyed by `stallId` — the lines, and the `Stall` object
+itself so checkout can build an order without re-fetching:
+
+```dart
+class CartViewModel extends ChangeNotifier {
+  final Map<String, List<OrderItem>> _itemsByStall = {};
+  final Map<String, Stall> _stalls = {};
+
+  List<String> get stallIds => _itemsByStall.keys.toList();
+  Stall stallFor(String stallId) => _stalls[stallId]!;
+  List<OrderItem> itemsFor(String stallId) =>
+      List.unmodifiable(_itemsByStall[stallId] ?? const []);
+
+  bool get isEmpty => _itemsByStall.isEmpty;
+
+  int get totalItemCount => _itemsByStall.values
+      .expand((list) => list)
+      .fold(0, (acc, i) => acc + i.quantity);
+}
+```
+
+**The merge rule** — the whole reason this class isn't just a `List`:
+
+```dart
+String _signature(OrderItem item) =>
+    '${item.itemId}|${item.customizations}|${item.addOns}|'
+    '${item.specialInstructions}';
+
+void addItem(Stall stall, OrderItem item) {
+  _stalls[stall.stallId] = stall;
+  final list = _itemsByStall.putIfAbsent(stall.stallId, () => []);
+  final sig = _signature(item);
+  final idx = list.indexWhere((e) => _signature(e) == sig);
+  if (idx >= 0) {
+    list[idx] = list[idx].copyWith(quantity: list[idx].quantity + item.quantity);
+  } else {
+    list.add(item);
+  }
+  notifyListeners();
+}
+```
+
+Two *Nasi Lemak, extra egg, no chilli* become one line of quantity 2; a *Nasi
+Lemak* with different add-ons stays its own line. Building the signature from
+`toString()` of the maps and lists is crude but correct here, because both are
+built in a fixed order by `item_detail_page.dart`.
+
+**Mutators all funnel through `updateQuantity`,** which is where the
+remove-at-zero rule lives — so there is exactly one place that decides a line
+is gone:
+
+```dart
+void updateQuantity(String stallId, int index, int quantity) {
+  final list = _itemsByStall[stallId];
+  if (list == null || index < 0 || index >= list.length) return;
+  if (quantity <= 0) {
+    removeItem(stallId, index);
+    return;
+  }
+  list[index] = list[index].copyWith(quantity: quantity);
+  notifyListeners();
+}
+
+void removeItem(String stallId, int index) {
+  final list = _itemsByStall[stallId];
+  if (list == null || index < 0 || index >= list.length) return;
+  list.removeAt(index);
+  // Dropping the last line drops the stall too, so `stallIds` never contains
+  // an empty group and the cart reports itself empty correctly.
+  if (list.isEmpty) {
+    _itemsByStall.remove(stallId);
+    _stalls.remove(stallId);
+  }
+  notifyListeners();
+}
+```
+
+`incrementItem` / `decrementItem` are one-liners delegating to
+`updateQuantity(stallId, index, list[index].quantity ± 1)`. Every mutator
+bounds-checks and returns silently — a stale index from a rebuilding list
+should be a no-op, not a crash.
+
+**The money getters** encode "one order per stall, one service fee per order":
+
+```dart
+int getSubtotal(String stallId) =>
+    (_itemsByStall[stallId] ?? const []).fold(0, (acc, i) => acc + i.subtotal);
+
+/// One fee per stall group — a two-stall cart is charged twice, because it
+/// becomes two separate orders.
+int getServiceFee(String stallId) =>
+    _itemsByStall.containsKey(stallId) ? AppConstants.serviceFeeCents : 0;
+
+int getStallTotal(String stallId) => getSubtotal(stallId) + getServiceFee(stallId);
+
+int get grandSubtotal => stallIds.fold(0, (acc, id) => acc + getSubtotal(id));
+int get totalServiceFee => stallIds.fold(0, (acc, id) => acc + getServiceFee(id));
+int get grandTotal => grandSubtotal + totalServiceFee;
+```
+
+Be ready to defend the double fee: each stall group is placed as its own
+transaction against its own vendor wallet, so each is a genuinely separate
+order rather than one order split across kitchens.
 
 ## 1.5 ⚠ `OrderRepository.placeOrder` (~8 h) — highest-risk file in the app
 
@@ -4819,6 +5184,262 @@ every write.** Violating it throws at runtime, not compile time.
       values at a non-0.10 rate (the Bug B regression test); a stall override
       beats the venue default.
 
+### Code for §1.5
+
+**The transaction body**, in the order the bullets above describe. The
+read/write boundary is marked with a comment — keep that comment in your file,
+it is the thing you will otherwise violate during a late edit:
+
+```dart
+Future<FoodOrder> placeOrder({
+  required AppUser customer,
+  required Stall stall,
+  required List<OrderItem> items,
+  int serviceFeeCents = AppConstants.serviceFeeCents,
+}) async {
+  final subtotal = items.fold<int>(0, (acc, i) => acc + i.subtotal);
+  final total = subtotal + serviceFeeCents;
+  final now = DateTime.now();
+  late FoodOrder order;
+
+  await _db.runTransaction((txn) async {
+    final customerRef = _userRef(customer.uid);
+    final vendorRef = _userRef(stall.vendorUid);
+
+    // --- reads first (Firestore requires all reads before writes) ---
+    final customerSnap = await txn.get(customerRef);
+    final vendorSnap = await txn.get(vendorRef);
+    final venueSnap = await txn.get(_venueRef);
+
+    final custBefore = (customerSnap.data()?['walletBalance'] ?? 0) as int;
+    if (custBefore < total) throw const InsufficientBalanceException();
+    final vendBefore = (vendorSnap.data()?['walletBalance'] ?? 0) as int;
+
+    final todayKey = _dateKey(now);
+    final storedDate = venueSnap.data()?['pickupCodeDate'] as String?;
+    final isNewDay = storedDate != todayKey;
+    final prefix =
+        isNewDay ? 'A' : (venueSnap.data()?['pickupCodePrefix'] ?? 'A') as String;
+    final counter =
+        isNewDay ? 0 : (venueSnap.data()?['pickupCodeCounter'] ?? 0) as int;
+    final nextCounter = counter + 1;
+    final pickupCode = '$prefix${nextCounter.toString().padLeft(3, '0')}';
+
+    final venueRate = (venueSnap.data()?['defaultCommission'] ??
+            AppConstants.defaultCommissionRate)
+        .toDouble();
+    final rate = stall.commissionRate ?? venueRate;
+    final vendorEarning = (subtotal * (1 - rate)).round();
+    final custAfter = custBefore - total;
+    final vendAfter = vendBefore + vendorEarning;
+
+    final orderRef = _orders.doc();
+    order = FoodOrder(
+      orderId: orderRef.id,
+      customerUid: customer.uid,
+      customerName: customer.name,
+      stallId: stall.stallId,
+      vendorUid: stall.vendorUid,
+      stallName: stall.name,
+      items: items,
+      subtotal: subtotal,
+      serviceFee: serviceFeeCents,
+      total: total,
+      commissionRate: rate,
+      vendorEarning: vendorEarning,
+      status: AppConstants.orderPreparing,
+      pickupCode: pickupCode,
+      createdAt: now,
+      updatedAt: now,
+    );
+
+    // --- writes ---
+    txn.set(orderRef, order.toJson());
+    txn.update(customerRef,
+        {'walletBalance': custAfter, 'updatedAt': Timestamp.fromDate(now)});
+    txn.update(vendorRef,
+        {'walletBalance': vendAfter, 'updatedAt': Timestamp.fromDate(now)});
+    txn.set(_venueRef, {
+      'pickupCodePrefix': prefix,
+      'pickupCodeCounter': nextCounter,
+      'pickupCodeDate': todayKey,
+      'updatedAt': Timestamp.fromDate(now),
+    }, SetOptions(merge: true));
+
+    _writeTxn(txn,
+        userId: customer.uid,
+        type: AppConstants.txnPayment,
+        amount: total,
+        before: custBefore,
+        after: custAfter,
+        description: 'Order ${order.pickupCode} • ${stall.name}',
+        orderId: orderRef.id);
+    _writeTxn(txn,
+        userId: stall.vendorUid,
+        type: AppConstants.txnEarning,
+        amount: vendorEarning,
+        before: vendBefore,
+        after: vendAfter,
+        description: 'Earning • Order ${order.pickupCode}',
+        orderId: orderRef.id);
+  });
+
+  return order;
+}
+```
+
+Note `order` is declared `late` outside the closure and assigned inside — the
+transaction callback can be retried by Firestore, and you want the value from
+the attempt that actually committed.
+
+**The refund half.** The interesting line is the one that *isn't* a
+calculation:
+
+```dart
+Future<void> cancelAndRefund(FoodOrder order) async {
+  if (order.refunded) return;
+  final now = DateTime.now();
+  await _db.runTransaction((txn) async {
+    final orderRef = _orders.doc(order.orderId);
+    final customerRef = _userRef(order.customerUid);
+    final vendorRef = _userRef(order.vendorUid);
+
+    final customerSnap = await txn.get(customerRef);
+    final vendorSnap = await txn.get(vendorRef);
+
+    final custBefore = (customerSnap.data()?['walletBalance'] ?? 0) as int;
+    final vendBefore = (vendorSnap.data()?['walletBalance'] ?? 0) as int;
+    final vendorEarning = order.vendorEarning;   // stored, never recomputed
+    final custAfter = custBefore + order.total;
+    final vendAfter = vendBefore - vendorEarning;
+
+    txn.update(orderRef, {
+      'status': AppConstants.orderCancelled,
+      'refunded': true,
+      'updatedAt': Timestamp.fromDate(now),
+      'cancelledAt': Timestamp.fromDate(now),
+    });
+    /* ...two wallet updates and two txnRefund ledger entries... */
+  });
+}
+```
+
+The `if (order.refunded) return;` guard makes the method idempotent, which
+matters because Yong Jun's cancel button and Justin's dispute resolution can
+both reach it for the same order.
+
+**The two helpers:**
+
+```dart
+/// Calendar-day key (`yyyy-MM-dd`) used to detect when the pickup-code
+/// counter should reset.
+static String _dateKey(DateTime d) =>
+    '${d.year.toString().padLeft(4, '0')}-'
+    '${d.month.toString().padLeft(2, '0')}-'
+    '${d.day.toString().padLeft(2, '0')}';
+
+void _writeTxn(
+  Transaction txn, {
+  required String userId,
+  required String type,
+  required int amount,
+  required int before,
+  required int after,
+  required String description,
+  String? orderId,
+}) {
+  final ref = _db.collection(AppConstants.transactionsCollection).doc();
+  txn.set(ref, WalletTransaction(
+    txnId: ref.id,
+    userId: userId,
+    type: type,
+    amount: amount,
+    balanceBefore: before,
+    balanceAfter: after,
+    description: description,
+    relatedOrderId: orderId,
+    createdAt: DateTime.now(),
+  ).toJson());
+}
+```
+
+**`test/repositories/order_repository_test.dart`** — `FakeFirebaseFirestore`
+in `setUp`, seeding a customer with `walletBalance: 10000` and a vendor at
+`0`, with a `stall` that has **no** `commissionRate` (so it inherits):
+
+```dart
+setUp(() async {
+  db = FakeFirebaseFirestore();
+  repo = OrderRepository(db: db);
+  await db.collection('users').doc('cust1').set(customer.toJson());
+  await db.collection('users').doc('vend1').set({
+    'uid': 'vend1',
+    'walletBalance': 0,
+    'updatedAt': Timestamp.fromDate(now),
+  });
+});
+```
+
+Express every expected balance as an arithmetic derivation, never a computed
+literal — `700 - 70` says *why* where `630` doesn't:
+
+```dart
+test('a null stall rate inherits the venue default', () async {
+  await db.collection('config').doc('venue').set({'defaultCommission': 0.15});
+
+  final order =
+      await repo.placeOrder(customer: customer, stall: stall, items: items);
+
+  final vend = await db.collection('users').doc('vend1').get();
+  expect(vend.data()!['walletBalance'], 700 - 105);
+  expect(order.commissionRate, 0.15);
+  expect(order.vendorEarning, 700 - 105);
+});
+
+test('an explicit stall rate overrides the venue default', () async {
+  await db.collection('config').doc('venue').set({'defaultCommission': 0.15});
+
+  final order = await repo.placeOrder(
+    customer: customer,
+    stall: stall.copyWith(commissionRate: 0.05),
+    items: items,
+  );
+
+  final vend = await db.collection('users').doc('vend1').get();
+  expect(vend.data()!['walletBalance'], 700 - 35);
+});
+```
+
+⚠️ **The regression test that matters most** — this is the one that fails
+against the reference repo's `_commissionFor`, and the reason the whole
+commission fix exists:
+
+```dart
+test('refund at a non-default rate returns both wallets to par', () async {
+  await db.collection('config').doc('venue').set({'defaultCommission': 0.15});
+
+  final order = await repo.placeOrder(
+    customer: customer,
+    stall: stall.copyWith(commissionRate: 0.05),
+    items: items,
+  );
+  await repo.cancelAndRefund(order);
+
+  // Reversing the stored vendorEarning rather than recomputing at a
+  // hardcoded 10% is what keeps these exact.
+  final cust = await db.collection('users').doc('cust1').get();
+  final vend = await db.collection('users').doc('vend1').get();
+  expect(cust.data()!['walletBalance'], 10000);
+  expect(vend.data()!['walletBalance'], 0);
+});
+```
+
+Credited at 5% (665) but reversed at a hardcoded 10% (630), the vendor would
+be left holding 35 cents of money that no longer exists anywhere. Also cover
+the pickup-code cases (increment, reset on a stale date, continue on today's
+date) and that an insufficient balance throws **and leaves the collections
+untouched**.
+
 ## 1.6 `WalletRepository` + `WalletViewModel` + `wallet_page.dart` (~5 h)
 `_applyDelta({uid, delta, type, description, relatedOrderId, requireFunds})` is
 the single private core; `topUp`, `refund`, `deductPayment`, `withdraw` are all
@@ -4841,6 +5462,170 @@ only handles top-ups and the ledger stream.
       rejects insufficient funds **and leaves the ledger empty**; withdraw;
       refund.
 
+### Code for §1.6
+
+**`_applyDelta` is the whole repository.** Everything else is a wrapper
+choosing a sign and a `type`:
+
+```dart
+Future<void> _applyDelta({
+  required String uid,
+  required int delta,
+  required String type,
+  required String description,
+  String? relatedOrderId,
+  bool requireFunds = false,
+}) async {
+  await _db.runTransaction((txn) async {
+    final ref = _userRef(uid);
+    final snap = await txn.get(ref);
+    if (!snap.exists) throw const NotFoundException('User not found');
+    final before = (snap.data()!['walletBalance'] ?? 0) as int;
+    final after = before + delta;
+    if (requireFunds && after < 0) {
+      throw const InsufficientBalanceException();
+    }
+    txn.update(ref, {
+      'walletBalance': after,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    });
+    final txnRef = _txns.doc();
+    txn.set(txnRef, WalletTransaction(
+      txnId: txnRef.id,
+      userId: uid,
+      type: type,
+      amount: delta.abs(),          // always positive; `type` carries direction
+      balanceBefore: before,
+      balanceAfter: after,
+      description: description,
+      relatedOrderId: relatedOrderId,
+      createdAt: DateTime.now(),
+    ).toJson());
+  });
+}
+```
+
+The four public methods:
+
+```dart
+Future<void> topUp(String uid, int cents) => _applyDelta(
+      uid: uid, delta: cents, type: AppConstants.txnTopUp, description: 'Top up');
+
+Future<void> refund(String uid, int cents,
+        {String? orderId, String description = 'Refund'}) =>
+    _applyDelta(uid: uid, delta: cents, type: AppConstants.txnRefund,
+        description: description, relatedOrderId: orderId);
+
+Future<void> deductPayment(String uid, int cents,
+        {String? orderId, String description = 'Payment'}) =>
+    _applyDelta(uid: uid, delta: -cents, type: AppConstants.txnPayment,
+        description: description, relatedOrderId: orderId, requireFunds: true);
+
+Future<void> withdraw(String uid, int cents) => _applyDelta(
+      uid: uid, delta: -cents, type: AppConstants.txnWithdrawal,
+      description: 'Withdrawal', requireFunds: true);
+```
+
+⚠️ Note `requireFunds` is **true for the two debits and false for the two
+credits** — a refund must succeed even against a wallet that has since been
+spent down, or a cancelled order could become unrefundable.
+
+`watchTransactions` takes the optional `types` filter Yong Jun depends on:
+
+```dart
+Stream<List<WalletTransaction>> watchTransactions(String uid,
+    {List<String>? types}) {
+  return _firestore
+      .collectionStream(
+        AppConstants.transactionsCollection,
+        query: (q) {
+          var query = q.where('userId', isEqualTo: uid);
+          if (types != null && types.isNotEmpty) {
+            query = query.where('type', whereIn: types);
+          }
+          return query.orderBy('createdAt', descending: true);
+        },
+      )
+      .map((rows) => rows.map(WalletTransaction.fromJson).toList());
+}
+```
+
+`getTransactions` is the same query through `getCollection`. **Keep this
+signature stable** — `EarningsRepository` calls it with
+`types: [txnEarning, txnWithdrawal, txnRefund]`.
+
+**`WalletViewModel`** is deliberately thin — it owns top-ups and the ledger
+stream, *not* the balance:
+
+```dart
+class WalletViewModel extends ChangeNotifier {
+  final WalletRepository _repository;
+  bool _processing = false;
+  String? _error;
+
+  bool get isProcessing => _processing;
+  String? get error => _error;
+
+  Stream<List<WalletTransaction>> transactions(String uid) =>
+      _repository.watchTransactions(uid);
+
+  Future<bool> topUp(String uid, int amountCents) async {
+    _error = null;
+    _processing = true;
+    notifyListeners();
+    try {
+      await _repository.topUp(uid, amountCents);
+      return true;
+    } catch (e) {
+      _error = 'Top-up failed. Please try again.';
+      return false;
+    } finally {
+      _processing = false;
+      notifyListeners();
+    }
+  }
+}
+```
+
+Returning `bool` rather than throwing keeps the failure handling in the view
+model; the page just checks the result and shows `vm.error`. The catch is
+deliberately broad — an unknown uid raises `NotFoundException` from
+`_applyDelta`, a dropped connection raises a `FirebaseException`, and the
+customer needs the same "try again" either way. The `finally` clearing
+`_processing` is what stops a failed top-up leaving the button spinning
+forever.
+
+**`wallet_page.dart`** — `WalletBalanceCard(balanceCents: user.walletBalance)`
+fed from `context.watch<AuthViewModel>().user`, **not** from this repository.
+One source of truth for the balance; the ledger is a separate stream. Preset
+chips come from `AppConstants.topUpPresetsCents`, plus a custom field using
+`rmToCents` and `Validators.price`.
+
+**`test/view_models/wallet_vm_test.dart`** — the assertion that earns its keep
+is the *negative* one:
+
+```dart
+test('deductPayment rejects insufficient balance and changes nothing',
+    () async {
+  await db.collection('users').doc('u1').set({'walletBalance': 500});
+
+  await expectLater(
+    repo.deductPayment('u1', 900),
+    throwsA(isA<InsufficientBalanceException>()),
+  );
+
+  final user = await db.collection('users').doc('u1').get();
+  expect(user.data()!['walletBalance'], 500);
+  final ledger = await db.collection('transactions').get();
+  expect(ledger.docs, isEmpty,
+      reason: 'a rejected debit must not leave a ledger row behind');
+});
+```
+
+Checking the ledger is empty is the point — a balance that rolled back while
+the ledger row survived is exactly the inconsistency the transaction exists to
+prevent.
+
 ## 1.7 Cart, checkout, order placed (~5 h)
 - [ ] `cart_page.dart` — one section per stall group with its own subtotal,
       service fee and total; quantity steppers; a place-order button per group.
@@ -4852,6 +5637,83 @@ only handles top-ups and the ledger stream.
       that is what the custom exception type is for.
 - [ ] `order_placed_page.dart` — `PickupCodeDisplay` (code + QR), stall name,
       estimated prep time, buttons to track the order or return home.
+
+### Code for §1.7
+
+⚠️ **Correction to the bullet above:** place **every** stall group in one
+pass, then `cart.clear()` once — not `clearStall` per group behind per-group
+buttons. A cart spanning two stalls is one checkout to the customer, and
+`OrderPlacedPage` shows all the resulting pickup codes together. Per-group
+buttons would leave a half-emptied cart on screen after the first tap.
+
+```dart
+Future<void> _placeOrder() async {
+  final cart = context.read<CartViewModel>();
+  final user = context.read<AuthViewModel>().currentUser;
+  if (user == null || cart.isEmpty) return;
+
+  // Cheap pre-check so the common failure never opens a transaction. The
+  // authoritative check is still inside placeOrder — this balance is a
+  // snapshot and could be stale.
+  if (user.walletBalance < cart.grandTotal) {
+    _snack('Insufficient wallet balance. Please top up.', isError: true);
+    return;
+  }
+
+  setState(() => _placing = true);
+  final placed = <FoodOrder>[];
+  try {
+    // One atomic order per stall group.
+    for (final stallId in cart.stallIds) {
+      final order = await _orderRepository.placeOrder(
+        customer: user,
+        stall: cart.stallFor(stallId),
+        items: cart.itemsFor(stallId),
+        serviceFeeCents: cart.getServiceFee(stallId),
+      );
+      placed.add(order);
+    }
+    cart.clear();
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => OrderPlacedPage(orders: placed)),
+    );
+  } on InsufficientBalanceException {
+    _snack('Insufficient wallet balance. Please top up.', isError: true);
+  } catch (e) {
+    _snack('Could not place order. Please try again.', isError: true);
+  } finally {
+    if (mounted) setState(() => _placing = false);
+  }
+}
+```
+
+Three things to be able to defend here:
+
+- **`if (!mounted) return;` after every `await`.** The user can navigate away
+  mid-placement; touching `context` on a disposed `State` throws.
+- **Catching `InsufficientBalanceException` separately** from the generic
+  `catch` is the entire reason `app_exceptions.dart` defines a typed
+  hierarchy — the customer gets "top up" rather than "try again", which is
+  actionable advice instead of a lie.
+- **The loop is not atomic across stalls.** Each `placeOrder` is its own
+  transaction, so a two-stall cart can place the first and fail the second.
+  That is accepted: the successfully placed order is real, paid for, and
+  visible in Orders, and `placed` carries only what actually committed.
+  Say so if asked — it is a deliberate trade, not an oversight. Making it
+  atomic across stalls would mean one transaction touching several vendor
+  wallets, which fails as soon as two customers order from overlapping stalls
+  at once.
+
+`_placing` disables the button so a double-tap can't double-charge, and
+`setState` is guarded by `mounted` in the `finally` for the same reason as
+above.
+
+**`order_placed_page.dart`** takes `List<FoodOrder> orders` and renders one
+`PickupCodeDisplay` per order — the code as text plus a `QrImageView` of the
+same string, which is what Yong Jun's scanner reads in his step 9. Offer
+"Track order" (push `OrderTrackingPage` for the first order) and "Back to
+home" (`popUntil((r) => r.isFirst)`).
 
 ## 1.8 Order tracking, list, review (~6 h)
 - [ ] `order_tracking_vm.dart` + `order_tracking_page.dart` — subscribes to
@@ -4870,12 +5732,202 @@ only handles top-ups and the ledger stream.
 - [ ] `customer_profile_page.dart` — profile display and edit, image upload via
       `StorageService`, password change, sign out.
 
+### Code for §1.8
+
+**`order_tracking_vm.dart`** is the standard single-stream view model — the
+only detail worth stating is that it subscribes to *one document*, so the
+vendor marking the order ready updates this screen with no polling:
+
+```dart
+OrderTrackingViewModel(this.orderId, {OrderRepository? repository})
+    : _repository = repository ?? OrderRepository() {
+  _sub = _repository.listenToOrder(orderId).listen(
+    (order) {
+      _order = order;
+      _loading = false;
+      notifyListeners();
+    },
+    onError: (Object e) {
+      _loading = false;
+      _error = 'Could not load this order.';
+      notifyListeners();
+    },
+  );
+}
+```
+
+**`order_tracking_page.dart`** — `OrderStatusStepper(status: order.status)`
+from §0.4, the item breakdown, and two status-gated pieces:
+
+```dart
+// The pickup QR only exists while the order is collectable. Showing it during
+// `preparing` invites a customer to queue at the counter too early; showing it
+// after `collected` invites a second collection attempt.
+if (order.status == AppConstants.orderReady)
+  PickupCodeDisplay(code: order.pickupCode),
+
+if (order.status == AppConstants.orderPreparing)
+  TextButton(
+    onPressed: _confirmCancel,   // AlertDialog -> repository.cancelAndRefund
+    child: const Text('Cancel order'),
+  ),
+```
+
+Cancelling is only offered while `preparing` — once the vendor has marked it
+ready the food exists, and cancellation becomes the vendor's decision, not the
+customer's.
+
+**`orders_list_page.dart`** — one stream, split in the widget rather than by
+two queries:
+
+```dart
+final active = orders
+    .where((o) => o.status == AppConstants.orderPreparing ||
+                  o.status == AppConstants.orderReady)
+    .toList();
+final past = orders.where((o) => !active.contains(o)).toList();
+```
+
+Tapping an active order opens tracking; a `collected` one offers **Leave a
+review**; a `cancelled` one is read-only.
+
+**`ReviewRepository.createReview`** — the transaction that stands in for an
+`onReviewCreated` Cloud Function. Both writes land together or neither does,
+so the stall's aggregate can never drift from the reviews that produced it:
+
+```dart
+Future<void> createReview(Review review) async {
+  await _db.runTransaction((txn) async {
+    final stallRef = _stallRef(review.stallId);
+    final stallSnap = await txn.get(stallRef);      // read before write
+
+    final reviewRef = _reviews.doc();
+    final saved = review.copyWith(reviewId: reviewRef.id);
+    txn.set(reviewRef, saved.toJson());
+
+    if (stallSnap.exists) {
+      final data = stallSnap.data()!;
+      final oldCount = (data['totalReviews'] ?? 0) as int;
+      final oldAvg = (data['averageRating'] ?? 0).toDouble();
+      final newCount = oldCount + 1;
+      final newAvg = ((oldAvg * oldCount) + review.rating) / newCount;
+      txn.update(stallRef, {
+        'totalReviews': newCount,
+        'averageRating': double.parse(newAvg.toStringAsFixed(2)),
+        'updatedAt': Timestamp.fromDate(DateTime.now()),
+      });
+    }
+  });
+}
+```
+
+The incremental mean `((oldAvg × oldCount) + rating) / (oldCount + 1)` avoids
+re-reading every review to recompute an average — an O(1) update instead of
+O(n). Rounding to 2 dp keeps the stored value from accumulating float drift
+across hundreds of reviews. The `if (stallSnap.exists)` guard means a review
+against a deleted stall still saves rather than throwing.
+
+One review per order is enforced by a query, not a rule:
+
+```dart
+Future<bool> hasReviewed(String orderId) async {
+  final rows = await _firestore.getCollection(
+    AppConstants.reviewsCollection,
+    query: (q) => q.where('orderId', isEqualTo: orderId).limit(1),
+  );
+  return rows.isNotEmpty;
+}
+```
+
+**`ReviewViewModel`** calls that from `checkExisting(orderId)` in the page's
+`initState` and exposes `alreadyReviewed` so the form renders as a
+"thanks, you've already reviewed this" state instead of a submittable form.
+`submit()` builds the `Review` with `reviewId: ''` — the repository assigns
+the real id from `_reviews.doc()` inside the transaction — and returns `bool`
+in the same shape as `WalletViewModel.topUp`.
+
 ## 1.9 Integration test (~2 h)
 - [ ] `integration_test/app_test.dart` — a boot smoke test asserting the app
       reaches a `Scaffold` with no lingering `CircularProgressIndicator`, plus
       a login test **skipped unless credentials are supplied** via
       `--dart-define=TEST_EMAIL=… --dart-define=TEST_PASSWORD=…`. Never commit
       credentials.
+
+### Code for §1.9
+
+**`integration_test/app_test.dart`** — lead with the header comment; it is the
+only place the run command and the credential contract are written down:
+
+```dart
+// Integration tests. Run on a real device/emulator with Firebase configured:
+//
+//   flutter test integration_test
+//
+// The login test needs a pre-created customer account, passed at run time so
+// no credentials live in the repo:
+//
+//   flutter test integration_test --dart-define=TEST_EMAIL=you@test.com \
+//       --dart-define=TEST_PASSWORD=secret123
+//
+// Without those defines the login test is skipped and only the boot smoke
+// test runs. Vendor/admin flows (mark ready, QR scan, approve, refund) need
+// camera hardware and seeded backend state, so they remain manual test cases.
+
+const testEmail = String.fromEnvironment('TEST_EMAIL');
+const testPassword = String.fromEnvironment('TEST_PASSWORD');
+
+void main() {
+  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('app boots to a stable first screen', (tester) async {
+    app.main();
+    await tester.pumpAndSettle(const Duration(seconds: 2));
+
+    // Signed out → login page; a remembered session → a role home. Either
+    // way the app must get past the splash without crashing.
+    expect(find.byType(Scaffold), findsWidgets);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+  });
+
+  testWidgets(
+    'customer can log in and land on their home',
+    skip: testEmail.isEmpty,
+    (tester) async {
+      app.main();
+      await tester.pumpAndSettle(const Duration(seconds: 2));
+
+      if (find.byType(LoginPage).evaluate().isEmpty) {
+        // A previous session is still signed in; nothing to test here.
+        return;
+      }
+
+      await tester.enterText(
+          find.widgetWithText(TextFormField, 'Email'), testEmail);
+      await tester.enterText(
+          find.widgetWithText(TextFormField, 'Password'), testPassword);
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Log in'));
+      await tester.pumpAndSettle(const Duration(seconds: 4));
+
+      // Customer shell shows the four bottom-nav tabs.
+      expect(find.text('Orders'), findsWidgets);
+      expect(find.text('Wallet'), findsWidgets);
+      expect(find.text('Profile'), findsWidgets);
+    },
+  );
+}
+```
+
+⚠️ `skip: testEmail.isEmpty` is what makes this safe to commit and safe to run
+on a machine with no credentials — the suite stays green either way rather
+than failing for an environmental reason. This is also why the tab labels in
+§1.2 are a contract: change `'Wallet'` to `'My wallet'` in
+`customer_home_page.dart` and this test fails with a message that points at
+the wrong file entirely.
+
+The boot test asserts on the *absence* of `CircularProgressIndicator` because
+the most likely real failure is not a crash but a hang — a stream that never
+emits leaves a spinner up forever, and `findsWidgets` on `Scaffold` alone
+would still pass.
 
 ---
 

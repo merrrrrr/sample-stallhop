@@ -105,6 +105,96 @@ never as a string literal.
       shouldn't rewrite the whole document.
 - [ ] `Future<void> deleteItem(stallId, itemId)`
 
+### Code for step 1
+
+The constructor and the two path helpers — every other method is built on
+these:
+
+```dart
+class MenuRepository {
+  final FirebaseFirestore _db;
+  final FirestoreService _firestore;
+
+  MenuRepository({FirebaseFirestore? db, FirestoreService? firestore})
+      : _db = db ?? FirebaseFirestore.instance,
+        _firestore = firestore ?? FirestoreService(db: db);
+
+  String _path(String stallId) =>
+      '${AppConstants.stallsCollection}/$stallId/'
+      '${AppConstants.menuItemsSubcollection}';
+
+  CollectionReference<Map<String, dynamic>> _col(String stallId) =>
+      _db.collection(_path(stallId));
+}
+```
+
+⚠️ **`addItem` generates the id before building the model**, which is the
+convention the whole app depends on:
+
+```dart
+Future<MenuItem> addItem({
+  required String stallId,
+  required String name,
+  required String description,
+  required int price,
+  required String category,
+  String? imageUrl,
+  List<Map<String, dynamic>> customizations = const [],
+  List<Map<String, dynamic>> addOns = const [],
+}) async {
+  final ref = _col(stallId).doc();      // id first...
+  final now = DateTime.now();
+  final item = MenuItem(
+    itemId: ref.id,                     // ...so it can live inside the model
+    stallId: stallId,
+    name: name,
+    description: description,
+    price: price,
+    category: category,
+    imageUrl: imageUrl,
+    customizations: customizations,
+    addOns: addOns,
+    createdAt: now,
+    updatedAt: now,
+  );
+  await ref.set(item.toJson());
+  return item;
+}
+```
+
+Calling `.doc()` with no argument generates the id **locally, without a
+network round-trip** — that is what lets the id be a field inside the document
+it names. Every StallHop model does this, and it is why `fromJson` alone is
+enough to rebuild a model from a raw data map with no `DocumentSnapshot` in
+hand. Returning the created item saves the caller a read.
+
+The three mutators, and why `setAvailable` is separate from `updateItem`:
+
+```dart
+Future<void> updateItem(MenuItem item) {
+  return _col(item.stallId).doc(item.itemId).set(
+        item.copyWith(updatedAt: DateTime.now()).toJson(),
+      );
+}
+
+/// A targeted update, not a whole-document `set`. The availability switch
+/// fires constantly during a service; rewriting every field each time would
+/// clobber a concurrent edit from the add/edit screen.
+Future<void> setAvailable(String stallId, String itemId, bool available) {
+  return _col(stallId).doc(itemId).update({
+    'available': available,
+    'updatedAt': Timestamp.fromDate(DateTime.now()),
+  });
+}
+
+Future<void> deleteItem(String stallId, String itemId) {
+  return _col(stallId).doc(itemId).delete();
+}
+```
+
+Note `updateItem` uses `set` (full replace) while `setAvailable` uses `update`
+(merge specific fields). Be able to say why each is right where it is.
+
 # STEP 2 — `MenuManagementViewModel` (2 h)
 
 `view_model/menu_management_vm.dart`
@@ -127,6 +217,68 @@ never as a string literal.
 - [ ] `delete(MenuItem item)`
 - [ ] `dispose()` → `_sub?.cancel()` then `super.dispose()`.
 
+### Code for step 2
+
+The entire class — it is short, and every view model you write after this one
+is the same shape:
+
+```dart
+class MenuManagementViewModel extends ChangeNotifier {
+  final MenuRepository _repository;
+  final String stallId;
+  StreamSubscription<List<MenuItem>>? _sub;
+
+  List<MenuItem> _items = [];
+  bool _loading = true;
+
+  MenuManagementViewModel(this.stallId, {MenuRepository? repository})
+      : _repository = repository ?? MenuRepository() {
+    _sub = _repository.watchMenuItems(stallId).listen(
+      (items) {
+        _items = items;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('MenuManagementViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
+  }
+
+  List<MenuItem> get items => _items;
+  bool get isLoading => _loading;
+
+  Future<void> toggleAvailable(MenuItem item) {
+    return _repository.setAvailable(stallId, item.itemId, !item.available);
+  }
+
+  Future<void> delete(MenuItem item) {
+    return _repository.deleteItem(stallId, item.itemId);
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+}
+```
+
+⚠️ **`_loading = false` appears in the `onError` branch too.** This is the bug
+Mervin demonstrated deliberately in the teaching session: if you only clear the
+flag on success, a Firestore permission error leaves `isLoading` true forever
+and the screen spins with no error, no log, and nothing to debug from. The
+`debugPrint` is the other half — without it the failure is completely silent.
+
+⚠️ **`toggleAvailable` changes no local state.** It writes to Firestore and
+returns. The write lands, the snapshot stream fires, `onData` replaces
+`_items`, `notifyListeners()` rebuilds the UI. Setting `item.available`
+locally *as well* would give you a switch that flickers — once from your
+optimistic update, once from the stream — and that drifts out of sync the
+moment a write fails. One direction of data flow: write down, read up.
+
 # STEP 3 — `menu_management_page.dart` (4 h)
 
 **Renders:** loading spinner → `EmptyState` if no items → grouped list.
@@ -143,6 +295,154 @@ never as a string literal.
 - [ ] Tap a row → push `AddEditItemPage(item: item)` (step 4).
 - [ ] Long-press or a menu → delete, behind an `AlertDialog` confirmation.
 - [ ] `FloatingActionButton` → `AddEditItemPage()` with no item (add mode).
+
+### Code for step 3
+
+> ⚠️ **Two deliberate additions over the reference repo.** It renders one flat
+> list with no category grouping, and its delete fires immediately from the
+> popup menu with no confirmation. The bullets above ask for both — a menu of
+> thirty items across five categories is unusable flat, and an accidental
+> delete is unrecoverable. Build them; they are also easy marks to defend.
+
+Provider at the top, private view underneath — the pattern for every page you
+own:
+
+```dart
+class MenuManagementPage extends StatelessWidget {
+  final String stallId;
+  const MenuManagementPage({super.key, required this.stallId});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (_) => MenuManagementViewModel(stallId),
+      child: _MenuView(stallId: stallId),
+    );
+  }
+}
+```
+
+The three render states, in this order — loading before empty, always, or an
+empty list flashes the empty state for one frame while the stream is still
+connecting:
+
+```dart
+final vm = context.watch<MenuManagementViewModel>();
+return Scaffold(
+  appBar: AppBar(title: const Text('Menu')),
+  floatingActionButton: FloatingActionButton.extended(
+    onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => AddEditItemPage(stallId: stallId),   // no item = add mode
+    )),
+    icon: const Icon(Icons.add),
+    label: const Text('Add item'),
+  ),
+  body: vm.isLoading
+      ? const LoadingIndicator()
+      : vm.items.isEmpty
+          ? const EmptyState(
+              icon: Icons.restaurant_menu,
+              title: 'No menu items',
+              subtitle: 'Tap "Add item" to create your first dish.',
+            )
+          : _GroupedMenuList(items: vm.items, vm: vm, stallId: stallId),
+);
+```
+
+**Grouping** — a `Map` built in `build` is fine at this scale (a stall has
+tens of items, not thousands):
+
+```dart
+Map<String, List<MenuItem>> _byCategory(List<MenuItem> items) {
+  final map = <String, List<MenuItem>>{};
+  for (final item in items) {
+    final key = item.category.isEmpty ? 'Uncategorised' : item.category;
+    map.putIfAbsent(key, () => []).add(item);
+  }
+  return map;
+}
+```
+
+Render each entry as a header `Text(category, style: AppTextStyles.title)`
+followed by its rows. Sorting the keys keeps the order stable between
+rebuilds — without it the sections jump around as items are edited.
+
+**Each row** is a `ListTile` with the availability switch inline:
+
+```dart
+ListTile(
+  leading: /* CachedNetworkImage thumbnail, or an Icons.restaurant placeholder
+              when item.imageUrl is null */,
+  title: Text(item.name, style: AppTextStyles.title),
+  subtitle: Text(centsToRM(item.price)),
+  onTap: () => Navigator.of(context).push(MaterialPageRoute(
+    builder: (_) => AddEditItemPage(stallId: stallId, item: item),  // edit mode
+  )),
+  trailing: Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Switch(
+            value: item.available,
+            onChanged: (_) => vm.toggleAvailable(item),
+          ),
+          Text(item.available ? 'Available' : 'Sold out',
+              style: AppTextStyles.caption),
+        ],
+      ),
+      PopupMenuButton<String>(
+        onSelected: (value) async {
+          if (value == 'edit') { /* push AddEditItemPage in edit mode */ }
+          if (value == 'delete') await _confirmDelete(context, vm, item);
+        },
+        itemBuilder: (_) => const [
+          PopupMenuItem(value: 'edit', child: Text('Edit')),
+          PopupMenuItem(
+            value: 'delete',
+            child: Text('Delete', style: TextStyle(color: AppColors.error)),
+          ),
+        ],
+      ),
+    ],
+  ),
+)
+```
+
+**The confirmation**, which the reference repo omits:
+
+```dart
+Future<void> _confirmDelete(
+    BuildContext context, MenuManagementViewModel vm, MenuItem item) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('Delete ${item.name}?'),
+      content: const Text(
+          'This removes the item from your menu permanently. Orders that '
+          'already contain it are not affected.'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(false),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(true),
+          child: const Text('Delete',
+              style: TextStyle(color: AppColors.error)),
+        ),
+      ],
+    ),
+  );
+  if (confirmed == true) await vm.delete(item);
+}
+```
+
+`showDialog<bool>` returns `null` when the user taps outside it, which is why
+the check is `== true` and not just `if (confirmed)`. The second sentence of
+the dialog matters: `OrderItem` copies the name and price at cart time, so
+deleting a menu item never corrupts a placed order. Know that answer.
 
 # STEP 4 — ⚠ `add_edit_item_page.dart` (12 h) — **the hardest file you own**
 
@@ -198,6 +498,279 @@ write it in one pass.
 - [ ] `Navigator.pop()` on success; a `SnackBar` on failure. Disable the save
       button while in flight so a double-tap can't create two items.
 
+### Code for step 4
+
+**4a — state and the two modes.** `widget.item == null` is the only thing
+distinguishing add from edit; derive everything else from it:
+
+```dart
+class _AddEditItemPageState extends State<AddEditItemPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _repository = MenuRepository();
+  final _storage = StorageService();
+
+  late final TextEditingController _name;
+  late final TextEditingController _description;
+  late final TextEditingController _price;
+  late final TextEditingController _category;
+
+  final List<_CustomizationDraft> _customizations = [];
+  final List<_AddOnDraft> _addOns = [];
+
+  File? _pickedImage;
+  String? _imageUrl;
+  bool _saving = false;
+
+  bool get _isEdit => widget.item != null;
+}
+```
+
+⚠️ **The cents/Ringgit boundary lives in `initState` and `_save`, nowhere
+else.** Seed the price controller by dividing, read it back by parsing — get
+either direction wrong and you are off by 100×:
+
+```dart
+@override
+void initState() {
+  super.initState();
+  final item = widget.item;
+  _name = TextEditingController(text: item?.name ?? '');
+  _description = TextEditingController(text: item?.description ?? '');
+  _price = TextEditingController(
+    text: item == null ? '' : (item.price / 100).toStringAsFixed(2),
+  );
+  _category = TextEditingController(text: item?.category ?? '');
+  _imageUrl = item?.imageUrl;
+  /* ...seed the customization and add-on drafts from item... */
+}
+```
+
+**The draft classes** are the key idea in this file. A dynamic list of text
+fields needs a stable `TextEditingController` per row — rebuild them in
+`build` and every keystroke resets the cursor:
+
+```dart
+class _CustomizationDraft {
+  final TextEditingController nameController;
+  final TextEditingController optionsController;
+
+  _CustomizationDraft({String name = '', String options = ''})
+      : nameController = TextEditingController(text: name),
+        optionsController = TextEditingController(text: options);
+
+  void dispose() {
+    nameController.dispose();
+    optionsController.dispose();
+  }
+}
+
+class _AddOnDraft {
+  final TextEditingController nameController;
+  final TextEditingController priceController;
+
+  _AddOnDraft({String name = '', double price = 0})
+      : nameController = TextEditingController(text: name),
+        priceController = TextEditingController(
+          text: price == 0 ? '' : price.toStringAsFixed(2),
+        );
+
+  void dispose() {
+    nameController.dispose();
+    priceController.dispose();
+  }
+}
+```
+
+Adding a row is `setState(() => _customizations.add(_CustomizationDraft()))`;
+removing is `setState(() => _customizations.removeAt(i)..dispose())` — dispose
+the removed draft or you leak a controller per deletion.
+
+`dispose()` must walk **both** lists as well as the four named controllers:
+
+```dart
+@override
+void dispose() {
+  _name.dispose();
+  _description.dispose();
+  _price.dispose();
+  _category.dispose();
+  for (final c in _customizations) { c.dispose(); }
+  for (final a in _addOns) { a.dispose(); }
+  super.dispose();
+}
+```
+
+**4b — image picking.** The bullets ask for a bottom sheet offering both
+sources; the reference repo only wires gallery, so this is yours to add:
+
+```dart
+Future<void> _pickImage(ImageSource source) async {
+  final picked = await ImagePicker().pickImage(
+    source: source,
+    maxWidth: 1024,        // resize before upload — a 12 MP phone photo is
+    imageQuality: 80,      // ~4 MB and takes forever on food-court wifi
+  );
+  if (picked != null) {
+    setState(() => _pickedImage = File(picked.path));
+  }
+}
+
+void _showImageSourceSheet() {
+  showModalBottomSheet<void>(
+    context: context,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.camera_alt),
+            title: const Text('Take a photo'),
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _pickImage(ImageSource.camera);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.photo_library),
+            title: const Text('Choose from gallery'),
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _pickImage(ImageSource.gallery);
+            },
+          ),
+        ],
+      ),
+    ),
+  );
+}
+```
+
+⚠️ Pop the sheet **before** calling `_pickImage`, not after — the picker opens
+a platform activity, and leaving the sheet mounted underneath it produces a
+stranded sheet when the user backs out. This is also the code path that
+hard-crashes on iOS without step 14's `Info.plist` strings.
+
+The preview is a three-way fallback: picked file → existing URL → placeholder.
+
+```dart
+Widget _imagePreview() {
+  if (_pickedImage != null) return Image.file(_pickedImage!, height: 160);
+  if (_imageUrl != null) return CachedNetworkImage(imageUrl: _imageUrl!, height: 160);
+  return Container(
+    height: 160,
+    color: AppColors.surface,
+    child: const Icon(Icons.add_a_photo, size: 40),
+  );
+}
+```
+
+**4c / 4d — the two editors.** Both are a `List` of drafts rendered with an
+index, plus an "add" button. The simplification worth taking: represent a
+group's options as **one comma-separated text field** rather than a chip
+editor with per-option add/remove.
+
+```dart
+List<Map<String, dynamic>> _buildCustomizations() {
+  return _customizations
+      .where((c) => c.nameController.text.trim().isNotEmpty)
+      .map((c) => {
+            'name': c.nameController.text.trim(),
+            'options': c.optionsController.text
+                .split(',')
+                .map((e) => e.trim())
+                .where((e) => e.isNotEmpty)
+                .toList(),
+          })
+      .toList();
+}
+
+List<Map<String, dynamic>> _buildAddOns() {
+  return _addOns
+      .where((a) => a.nameController.text.trim().isNotEmpty)
+      .map((a) => {
+            'name': a.nameController.text.trim(),
+            'price': rmToCents(a.priceController.text) ?? 0,   // cents!
+          })
+      .toList();
+}
+```
+
+The `.where(...isNotEmpty)` filters are what make step 4c's "removing the last
+option removes the group" fall out for free — an empty name or an empty
+options string simply doesn't survive into the saved map, so a half-filled row
+the vendor abandoned is silently dropped rather than saved as a broken group.
+If you prefer the chip UI from the bullet, build it on top of these same
+drafts; `_buildCustomizations` doesn't change.
+
+**4e — save.** Validate, upload only if changed, then branch on the mode:
+
+```dart
+Future<void> _save() async {
+  if (!_formKey.currentState!.validate()) return;
+  setState(() => _saving = true);
+  try {
+    var imageUrl = _imageUrl;
+    if (_pickedImage != null) {          // skip the upload when unchanged
+      imageUrl = await _storage.uploadImage(
+        _pickedImage!,
+        'stalls/${widget.stallId}/menu/'
+            '${DateTime.now().millisecondsSinceEpoch}.jpg',
+      );
+    }
+    final priceCents = rmToCents(_price.text) ?? 0;
+    if (_isEdit) {
+      await _repository.updateItem(widget.item!.copyWith(
+        name: _name.text.trim(),
+        description: _description.text.trim(),
+        price: priceCents,
+        category: _category.text.trim(),
+        imageUrl: imageUrl,
+        customizations: _buildCustomizations(),
+        addOns: _buildAddOns(),
+      ));
+    } else {
+      await _repository.addItem(
+        stallId: widget.stallId,
+        name: _name.text.trim(),
+        /* ...same fields... */
+      );
+    }
+    if (mounted) Navigator.of(context).pop();
+  } catch (e) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Could not save item.'),
+        backgroundColor: AppColors.error,
+      ));
+    }
+  } finally {
+    if (mounted) setState(() => _saving = false);
+  }
+}
+```
+
+The timestamp filename means an edited item's new photo never overwrites the
+old one mid-flight — a viewer holding the previous URL keeps seeing a valid
+image rather than a broken link.
+
+The save button carries the in-flight state, which is the double-tap guard:
+
+```dart
+ElevatedButton(
+  onPressed: _saving ? null : _save,
+  child: _saving
+      ? const SizedBox(
+          height: 22, width: 22,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+        )
+      : Text(_isEdit ? 'Save changes' : 'Add item'),
+)
+```
+
+`onPressed: null` genuinely disables the button — don't rely on an `if
+(_saving) return;` inside `_save`, because the button still looks tappable and
+the vendor will tap it again during a slow upload.
+
 # STEP 5 — `VendorOrderRepository` (4 h)
 
 `repository/vendor_order_repository.dart`. Two responsibilities: the vendor's
@@ -229,6 +802,138 @@ own **stall** document, and the **order queue** (which it delegates).
       `cancelOrder(order)` → `cancelAndRefund(order)`.
       **You write no wallet code at all.**
 
+### Code for step 5
+
+**Three injectable dependencies**, and note `OrderRepository(db: db)` — the
+same fake Firestore has to reach the delegated repository too, or your step 13
+tests will hit the real backend through the back door:
+
+```dart
+class VendorOrderRepository {
+  final FirebaseFirestore _db;
+  final FirestoreService _firestore;
+  final OrderRepository _orderRepository;
+
+  VendorOrderRepository({
+    FirebaseFirestore? db,
+    FirestoreService? firestore,
+    OrderRepository? orderRepository,
+  })  : _db = db ?? FirebaseFirestore.instance,
+        _firestore = firestore ?? FirestoreService(db: db),
+        _orderRepository = orderRepository ?? OrderRepository(db: db);
+
+  CollectionReference<Map<String, dynamic>> get _stalls =>
+      _db.collection(AppConstants.stallsCollection);
+}
+```
+
+**The stall half.** `limit(1)` plus a nullable single result, because a vendor
+owns at most one stall:
+
+```dart
+Stream<Stall?> watchMyStall(String vendorUid) {
+  return _firestore
+      .collectionStream(
+        AppConstants.stallsCollection,
+        query: (q) => q.where('vendorUid', isEqualTo: vendorUid).limit(1),
+      )
+      .map((rows) => rows.isEmpty ? null : Stall.fromJson(rows.first));
+}
+```
+
+`null` is a real state here, not an error — it is what makes the dashboard show
+the create-stall form instead of the dashboard. `getMyStall` is the same query
+through `getCollection`.
+
+⚠️ **`createStall` writes no `commissionRate` at all:**
+
+```dart
+Future<Stall> createStall({
+  required String vendorUid,
+  required String name,
+  required String cuisine,
+  required String description,
+  int prepTimeMinutes = 15,
+}) async {
+  final ref = _stalls.doc();
+  final now = DateTime.now();
+  final stall = Stall(
+    stallId: ref.id,
+    vendorUid: vendorUid,
+    name: name,
+    cuisine: cuisine,
+    description: description,
+    status: AppConstants.stallPending,
+    prepTimeMinutes: prepTimeMinutes,
+    // No commissionRate — the field is nullable and null means "inherit the
+    // venue-wide default the admin controls". The reference repo hardcodes
+    // AppConstants.defaultCommissionRate here, which is exactly why the
+    // admin's setting never reaches pricing (foundation_and_integration.md
+    // §6.1). A non-null value is an admin-only negotiated override.
+    createdAt: now,
+    updatedAt: now,
+  );
+  await ref.set(stall.toJson());
+  return stall;
+}
+```
+
+`status: AppConstants.stallPending` is what keeps the stall out of
+`StallRepository.watchVisibleStalls()` until Justin's admin approves it.
+
+The updates funnel through one method so `updatedAt` is stamped in exactly one
+place:
+
+```dart
+Future<void> updateStall(String stallId, Map<String, dynamic> data) {
+  return _stalls.doc(stallId).update({
+    ...data,
+    'updatedAt': Timestamp.fromDate(DateTime.now()),
+  });
+}
+
+Future<void> setOpen(String stallId, bool open) => updateStall(stallId, {
+      'status': open ? AppConstants.stallOpen : AppConstants.stallClosed,
+    });
+
+Future<void> setPrepTime(String stallId, int minutes) =>
+    updateStall(stallId, {'prepTimeMinutes': minutes});
+```
+
+**The order half is six one-line delegations.** This is the part to be able to
+defend — there is deliberately no logic here:
+
+```dart
+Stream<List<FoodOrder>> watchActiveOrders(String vendorUid) {
+  return _orderRepository.watchVendorOrders(
+    vendorUid,
+    statuses: const [AppConstants.orderPreparing, AppConstants.orderReady],
+  );
+}
+
+Stream<List<FoodOrder>> watchAllOrders(String vendorUid) =>
+    _orderRepository.watchVendorOrders(vendorUid);
+
+Stream<FoodOrder?> listenToOrder(String orderId) =>
+    _orderRepository.listenToOrder(orderId);
+
+Future<void> markReady(String orderId) =>
+    _orderRepository.updateStatus(orderId, AppConstants.orderReady);
+
+Future<void> markCollected(String orderId) =>
+    _orderRepository.updateStatus(orderId, AppConstants.orderCollected);
+
+Future<void> cancelOrder(FoodOrder order) =>
+    _orderRepository.cancelAndRefund(order);
+```
+
+**Why this class exists at all if it just forwards:** it gives the vendor
+feature one seam to inject in tests and one place to look for "what can a
+vendor do to an order", without duplicating the transactional wallet code. If
+`cancelOrder` contained its own refund logic, there would be two
+implementations of a money reversal and they would drift — which is precisely
+the bug §6.1 documents.
+
 # STEP 6 — `OrderQueueViewModel` (2 h)
 
 - [ ] Subscribes to `watchActiveOrders(vendorUid)` in the constructor
@@ -239,6 +944,67 @@ own **stall** document, and the **order queue** (which it delegates).
       Oldest first is correct for a kitchen queue; be ready to say why.
 - [ ] `markReady(orderId)` delegating to the repository.
 - [ ] `dispose()` cancels.
+
+### Code for step 6
+
+One subscription, two computed getters over the same list:
+
+```dart
+class OrderQueueViewModel extends ChangeNotifier {
+  final VendorOrderRepository _repository;
+  StreamSubscription<List<FoodOrder>>? _sub;
+
+  List<FoodOrder> _orders = [];
+  bool _loading = true;
+
+  OrderQueueViewModel(String vendorUid, {VendorOrderRepository? repository})
+      : _repository = repository ?? VendorOrderRepository() {
+    _sub = _repository.watchActiveOrders(vendorUid).listen(
+      (orders) {
+        _orders = orders;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('OrderQueueViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
+  }
+
+  bool get isLoading => _loading;
+
+  List<FoodOrder> get preparing => _orders
+      .where((o) => o.status == AppConstants.orderPreparing)
+      .toList()
+    ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+  List<FoodOrder> get ready => _orders
+      .where((o) => o.status == AppConstants.orderReady)
+      .toList()
+    ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+  Future<void> markReady(String orderId) => _repository.markReady(orderId);
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+}
+```
+
+Two things to be ready to explain:
+
+- **`.toList()` before `..sort()`.** `where` returns a lazy `Iterable` with no
+  `sort`, and sorting `_orders` in place would mutate the field the stream
+  owns. `toList()` gives you a fresh list to reorder safely.
+- **Oldest-first, not newest-first.** A kitchen queue is FIFO — the customer
+  who has waited longest should be cooked next. Newest-first is the right
+  default for a *history* list (which is why `watchVendorOrders` orders
+  `createdAt` descending) and the wrong one for a work queue. This getter
+  deliberately reverses the repository's ordering.
 
 # STEP 7 — `order_queue_page.dart` (5 h)
 
@@ -252,12 +1018,176 @@ own **stall** document, and the **order queue** (which it delegates).
 - [ ] Watch it work: with two devices, a customer order should appear here
       **without any refresh** — that's the snapshot stream.
 
+### Code for step 7
+
+**The tab shell.** Counts go straight in the labels — a vendor glancing at the
+phone across the counter needs the number without reading the list:
+
+```dart
+final vm = context.watch<OrderQueueViewModel>();
+return DefaultTabController(
+  length: 2,
+  child: Scaffold(
+    appBar: AppBar(
+      title: const Text('Order queue'),
+      bottom: TabBar(
+        tabs: [
+          Tab(text: 'Preparing (${vm.preparing.length})'),
+          Tab(text: 'Ready (${vm.ready.length})'),
+        ],
+      ),
+    ),
+    body: vm.isLoading
+        ? const LoadingIndicator()
+        : TabBarView(
+            children: [
+              _OrderColumn(
+                orders: vm.preparing,
+                emptyTitle: 'No orders to prepare',
+                primaryLabel: 'Mark ready',
+                onPrimary: (o) => vm.markReady(o.orderId),
+              ),
+              _OrderColumn(
+                orders: vm.ready,
+                emptyTitle: 'No orders awaiting pickup',
+                primaryLabel: 'Verify & complete',
+                onPrimary: (o) => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => VendorOrderDetailPage(orderId: o.orderId),
+                )),
+              ),
+            ],
+          ),
+  ),
+);
+```
+
+⚠️ **Write `_OrderColumn` once and parameterise it**, rather than two
+near-identical tab bodies. The tabs differ in exactly three things — the list,
+the empty message, and what the primary button does — so they become
+constructor arguments:
+
+```dart
+class _OrderColumn extends StatelessWidget {
+  final List<FoodOrder> orders;
+  final String emptyTitle;
+  final String primaryLabel;
+  final void Function(FoodOrder) onPrimary;
+}
+```
+
+Note the two `onPrimary`s are genuinely different in kind: Preparing performs
+the state change inline (`vm.markReady`), while Ready *navigates* — because
+completing an order requires the QR verification in step 9 and must never be a
+one-tap action from a list.
+
+**The card.** Pickup code first and largest; it is what the vendor shouts
+across the counter:
+
+```dart
+Card(
+  child: Padding(
+    padding: const EdgeInsets.all(16),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('#${order.pickupCode}',
+                style: AppTextStyles.h3.copyWith(color: AppColors.orange)),
+            Text(timeAgo(order.createdAt), style: AppTextStyles.caption),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(order.customerName, style: AppTextStyles.bodySecondary),
+        const Divider(),
+        for (final item in order.items)
+          Text('${item.quantity}× ${item.name}', style: AppTextStyles.body),
+        const SizedBox(height: 12),
+        Row(children: [
+          Expanded(child: OutlinedButton(/* Details -> detail page */)),
+          const SizedBox(width: 12),
+          Expanded(child: ElevatedButton(
+            onPressed: () => onPrimary(order),
+            child: Text(primaryLabel),
+          )),
+        ]),
+      ],
+    ),
+  ),
+)
+```
+
+`timeAgo(order.createdAt)` rather than a timestamp is deliberate — "12 min
+ago" tells a vendor whether they are behind; "13:42" makes them do arithmetic.
+
+Empty state per tab, not per page: `EmptyState(icon: Icons.inbox_outlined,
+title: emptyTitle)` inside `_OrderColumn`, so Preparing can be empty while
+Ready is not.
+
 # STEP 8 — `VendorOrderDetailViewModel` (1.5 h)
 
 - [ ] Constructor takes `orderId`, subscribes to `listenToOrder(orderId)`,
       holds `FoodOrder? _order` and `bool _loading`, `onError` handler,
       `dispose()` cancels.
 - [ ] Passthrough methods: `markReady`, `markCollected`, `cancel(order)`.
+
+### Code for step 8
+
+Structurally identical to step 6, but subscribed to a **single document**
+rather than a query:
+
+```dart
+class VendorOrderDetailViewModel extends ChangeNotifier {
+  final VendorOrderRepository _repository;
+  StreamSubscription<FoodOrder?>? _sub;
+
+  FoodOrder? _order;
+  bool _loading = true;
+
+  FoodOrder? get order => _order;
+  bool get isLoading => _loading;
+
+  VendorOrderDetailViewModel(String orderId,
+      {VendorOrderRepository? repository})
+      : _repository = repository ?? VendorOrderRepository() {
+    _sub = _repository.listenToOrder(orderId).listen(
+      (order) {
+        _order = order;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorOrderDetailViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
+  }
+
+  Future<void> markReady(String orderId) => _repository.markReady(orderId);
+
+  Future<void> markCollected(String orderId) =>
+      _repository.markCollected(orderId);
+
+  Future<void> cancel(FoodOrder order) => _repository.cancelOrder(order);
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+}
+```
+
+`FoodOrder?` is nullable for a real reason: the document stream emits `null` if
+the order is deleted while the screen is open. Render that as "order not
+found" rather than letting a `!` throw.
+
+The three passthroughs take an `orderId` (or order) argument rather than
+closing over the constructor's, which lets the page call them for the order it
+currently has in hand — worth keeping consistent even though they will always
+match.
 
 # STEP 9 — `order_detail_page.dart` (9 h)
 
@@ -290,6 +1220,168 @@ screen you own and a good one to demo.
       ⚠ This screen also hard-crashes on iOS without the `Info.plist` fix
       (step 14).
 
+### Code for step 9
+
+> ⚠️ **Refinement on the pseudocode in the bullet above.** Don't call
+> `markCollected` directly from the scan result. Split it: the scan sets a
+> local `_verified` flag, and a separate **Complete order** button (enabled
+> only once `_verified`) performs the state change. A scanner can misfire on a
+> reflection or a neighbouring customer's screen, and a one-step flow makes
+> that mistake instantly irreversible — the order is collected and the
+> customer's food is gone. Two steps costs one tap and gives the vendor a
+> chance to see the green tick before committing.
+
+The host is a `StatefulWidget` because `_verified` is transient screen state
+that must not survive a rebuild from the order stream:
+
+```dart
+class _DetailViewState extends State<_DetailView> {
+  bool _verified = false;
+```
+
+**The scan.** Handle all three outcomes — dismissed, mismatch, match:
+
+```dart
+Future<void> _scan(FoodOrder order) async {
+  final code = await Navigator.of(context).push<String>(
+    MaterialPageRoute(builder: (_) => const QrScannerPage()),
+  );
+  if (code == null || !mounted) return;        // user backed out — do nothing
+  final match = code.trim() == order.pickupCode.trim();
+  setState(() => _verified = match);
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      content: Text(match
+          ? 'Code verified ✓ — you can complete the order.'
+          : 'Code mismatch. Scanned "$code".'),
+      backgroundColor: match ? AppColors.teal : AppColors.error,
+    ),
+  );
+}
+```
+
+Three details that matter:
+
+- **`.trim()` on both sides.** Some scanners append whitespace or a newline to
+  the decoded payload, and an untrimmed compare fails a valid code with no
+  visible reason.
+- **Echo the scanned value back** in the mismatch message. "Code mismatch" on
+  its own is undebuggable at a busy counter; showing what was actually read
+  tells the vendor instantly whether they scanned the wrong customer's screen.
+- **A mismatch sets `_verified = false`,** not just "does nothing" — a
+  previously successful scan must be invalidated by a subsequent bad one.
+
+**Manual entry**, which the reference repo lacks and you will want during the
+live demo when a camera won't focus:
+
+```dart
+Future<void> _enterCodeManually(FoodOrder order) async {
+  final controller = TextEditingController();
+  final entered = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Enter pickup code'),
+      content: TextField(
+        controller: controller,
+        autofocus: true,
+        textCapitalization: TextCapitalization.characters,
+        decoration: const InputDecoration(hintText: 'e.g. A014'),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(ctx, controller.text),
+          child: const Text('Verify'),
+        ),
+      ],
+    ),
+  );
+  controller.dispose();
+  if (entered == null || !mounted) return;
+  final match =
+      entered.trim().toUpperCase() == order.pickupCode.trim().toUpperCase();
+  setState(() => _verified = match);
+  /* ...same SnackBar as _scan... */
+}
+```
+
+Case-insensitive here but not in `_scan`, because a human types `a014` and a
+scanner does not. Dispose the controller — a dialog-local controller is still
+a controller.
+
+**Status-driven actions.** The screen shows exactly one primary action, chosen
+by the order's current status:
+
+```dart
+switch (order.status) {
+  case AppConstants.orderPreparing:
+    // "Mark ready" -> vm.markReady(order.orderId)
+  case AppConstants.orderReady:
+    // "Scan to verify" -> _scan(order), plus a text button for manual entry,
+    // then "Complete order" enabled only when _verified
+  case AppConstants.orderCollected:
+    // no actions — terminal state
+}
+```
+
+```dart
+ElevatedButton(
+  onPressed: _verified ? () => _complete(vm, order.orderId) : null,
+  child: const Text('Complete order'),
+)
+```
+
+**Cancel, behind a confirmation** that names the money consequence:
+
+```dart
+Future<void> _cancel(VendorOrderDetailViewModel vm, FoodOrder order) async {
+  final confirm = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Cancel order?'),
+      content: const Text(
+        'The customer will be automatically refunded the full amount.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Keep order'),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Cancel & refund'),
+        ),
+      ],
+    ),
+  );
+  if (confirm == true) {
+    await vm.cancel(order);      // -> Mervin's cancelAndRefund transaction
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Order cancelled and refunded')),
+      );
+    }
+  }
+}
+```
+
+The destructive action is the `ElevatedButton` and the safe one is the
+`TextButton` — but the *labels* carry the meaning ("Keep order" / "Cancel &
+refund") rather than Yes/No, because "Cancel" in a dialog titled "Cancel
+order?" is genuinely ambiguous.
+
+Above the actions, render the full breakdown: pickup code and status chip,
+customer name, `formatDateTime(order.createdAt)`, then per `OrderItem` the
+quantity, name, chosen `customizations`, selected `addOns`,
+`specialInstructions`, and `centsToRM(item.subtotal)` — finishing with
+subtotal, service fee and `centsToRM(order.total)`. The vendor needs the
+instructions visible without tapping anything; that is the whole point of the
+screen for the kitchen.
+
 # STEP 10 — `VendorDashboardViewModel` (3 h)
 
 - [ ] Constructor takes `vendorUid` and opens **two** subscriptions — the stall
@@ -310,6 +1402,109 @@ screen you own and a good one to demo.
 - [ ] `toggleOpen(bool)`, `updatePrepTime(int)`, `createStall({...})`, each
       setting an `_updating` flag around the await so the UI can disable
       controls.
+
+### Code for step 10
+
+**Two subscriptions, two cancels.** Note only the *stall* stream clears
+`_loadingStall` — the orders stream arriving late must not flip the page out
+of its loading state before the stall is known:
+
+```dart
+VendorDashboardViewModel(this.vendorUid, {VendorOrderRepository? repository})
+    : _repository = repository ?? VendorOrderRepository() {
+  _stallSub = _repository.watchMyStall(vendorUid).listen(
+    (stall) {
+      _stall = stall;
+      _loadingStall = false;
+      notifyListeners();
+    },
+    onError: (Object e) {
+      debugPrint('VendorDashboardViewModel stall stream error: $e');
+      _loadingStall = false;
+      notifyListeners();
+    },
+  );
+  _ordersSub = _repository.watchAllOrders(vendorUid).listen(
+    (orders) {
+      _orders = orders;
+      notifyListeners();
+    },
+    onError: (Object e) {
+      debugPrint('VendorDashboardViewModel orders stream error: $e');
+    },
+  );
+}
+
+@override
+void dispose() {
+  _stallSub?.cancel();
+  _ordersSub?.cancel();
+  super.dispose();
+}
+```
+
+`hasStall => _stall != null` is the switch between the two screens in step 11.
+
+**The date filter compares calendar fields, not a duration:**
+
+```dart
+List<FoodOrder> get _todayOrders {
+  final now = DateTime.now();
+  return _orders.where((o) {
+    final d = o.createdAt;
+    return d.year == now.year &&
+        d.month == now.month &&
+        d.day == now.day &&
+        o.status != AppConstants.orderCancelled;
+  }).toList();
+}
+```
+
+⚠️ `now.subtract(const Duration(hours: 24))` would be wrong: at 09:00 it
+includes yesterday evening's orders, so "today's earnings" changes meaning
+depending on when the vendor looks at it. A vendor reconciling their till at
+close needs *this calendar day*.
+
+Cancelled orders are excluded here, once, so every KPI built on `_todayOrders`
+inherits the exclusion — a refunded order was never income.
+
+⚠️ **`todayEarnings` sums the stored per-order figure:**
+
+```dart
+/// Today's gross earnings for this vendor (subtotal minus commission), cents.
+int get todayEarnings =>
+    _todayOrders.fold(0, (acc, o) => acc + o.vendorEarning);
+```
+
+The reference repo computes `subtotal × (1 − stall.commissionRate)` against
+the stall's **current** rate. That is wrong the moment a rate changes: orders
+placed last week get recomputed at today's rate, and the dashboard disagrees
+with the wallet the vendor can actually withdraw from. `vendorEarning` is
+written by Mervin's `placeOrder` at the instant of sale and is the only
+truthful figure. One line, but it is a likely Q&A question — know why.
+
+**The mutators** each guard on a null stall and flag `_updating` around the
+await:
+
+```dart
+Future<void> toggleOpen(bool open) async {
+  final stall = _stall;
+  if (stall == null) return;
+  _updating = true;
+  notifyListeners();
+  try {
+    await _repository.setOpen(stall.stallId, open);
+  } finally {
+    _updating = false;
+    notifyListeners();
+  }
+}
+```
+
+`createStall({name, cuisine, description, prepTimeMinutes})` follows the same
+`_updating` / `try` / `finally` shape, forwarding `vendorUid` from the field.
+The `finally` is what stops a failed write leaving the whole dashboard's
+controls permanently disabled.
 
 # STEP 11 — ⚠ `vendor_dashboard_page.dart` (12 h) — biggest file in the app
 
@@ -342,6 +1537,138 @@ long rather than hard. Build them separately.
 is both unreadable and very hard to defend in a Q&A; six 80-line widgets are
 easy to explain one at a time.
 
+### Code for step 11
+
+**The top-level split** is one ternary — this is the "two screens in one
+widget" the intro refers to:
+
+```dart
+final vm = context.watch<VendorDashboardViewModel>();
+if (vm.loadingStall) return const LoadingIndicator();
+return vm.hasStall ? const _DashboardTab() : const _CreateStallForm();
+```
+
+Take the tip seriously and declare these as separate private widgets:
+`_StallHeader`, `_Banner`, `_StatsRow`, `_StatCard`, `_ActiveOrdersPreview`,
+`_CreateStallForm`. Each is 40–80 lines and independently explainable.
+
+⚠️ **11b — the open/closed guard.** This is the one piece of real logic on the
+page, and the bullet above is easy to under-implement:
+
+```dart
+final stall = vm.stall!;
+final isPending = stall.status == AppConstants.stallPending;
+final isSuspended = stall.status == AppConstants.stallSuspended;
+final canToggle = !isPending && !isSuspended;
+
+// ...
+if (canToggle)
+  Column(
+    children: [
+      Switch(
+        value: stall.status == AppConstants.stallOpen,
+        onChanged: vm.isUpdating ? null : (v) => vm.toggleOpen(v),
+      ),
+      Text(
+        stall.status == AppConstants.stallOpen ? 'Open' : 'Closed',
+        style: AppTextStyles.caption,
+      ),
+    ],
+  ),
+```
+
+Two separate disables, doing different jobs — don't collapse them:
+
+- **`if (canToggle)` removes the switch entirely** for a pending or suspended
+  stall. A vendor whose stall is awaiting approval or has been suspended by an
+  admin must not be able to trade, and a greyed-out switch invites them to
+  keep tapping it. Guarding on **status**, not on the switch's boolean, is the
+  point of the bullet — `value: status == open` would render "closed" for a
+  suspended stall and make opening look like a legitimate option.
+- **`onChanged: vm.isUpdating ? null : ...`** disables it only during an
+  in-flight write, so a double-tap can't queue two conflicting status writes.
+
+Replace the switch with an explanatory banner in those states, so the screen
+says *why* rather than just omitting a control:
+
+```dart
+if (isPending)
+  _Banner(
+    color: AppColors.orange,
+    icon: Icons.hourglass_top,
+    message: 'Your stall is awaiting admin approval. Customers cannot see '
+        'it yet.',
+  ),
+if (isSuspended)
+  _Banner(
+    color: AppColors.error,
+    icon: Icons.block,
+    message: 'This stall has been suspended. Contact the food court admin.',
+  ),
+```
+
+**The KPI row** — one `_StatCard` per figure, and every money value goes
+through `centsToRM`:
+
+```dart
+Row(
+  children: [
+    Expanded(child: _StatCard(
+      label: "Today's orders", value: '${vm.todayOrderCount}')),
+    Expanded(child: _StatCard(
+      label: 'Earnings', value: centsToRM(vm.todayEarnings))),
+    Expanded(child: _StatCard(
+      label: 'Active', value: '${vm.activeOrders.length}')),
+  ],
+)
+```
+
+Never render `vm.todayEarnings` directly — it is cents, and `85000` on a
+dashboard reads as eighty-five thousand Ringgit. Your step 13 widget test
+should assert the formatted string is present *and* that the raw integer is
+absent.
+
+**The active-orders preview** takes the first few and links out rather than
+duplicating the queue:
+
+```dart
+final preview = vm.activeOrders.take(5).toList();
+// ...one compact row per order, then:
+TextButton(
+  onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+    builder: (_) => OrderQueuePage(vendorUid: vm.vendorUid),
+  )),
+  child: Text('View all ${vm.activeOrders.length}'),
+)
+```
+
+**11a — the create-stall form** is a `StatefulWidget` with its own
+`GlobalKey<FormState>` and four controllers (name, cuisine, description, prep
+time), disposed in `dispose()`. Submit:
+
+```dart
+Future<void> _submit() async {
+  if (!_formKey.currentState!.validate()) return;
+  await context.read<VendorDashboardViewModel>().createStall(
+        name: _name.text.trim(),
+        cuisine: _cuisine.text.trim(),
+        description: _description.text.trim(),
+        prepTimeMinutes: int.tryParse(_prepTime.text) ?? 15,
+      );
+  // No navigation needed — the stall stream fires, hasStall flips to true,
+  // and the dashboard replaces this form on the next rebuild.
+}
+```
+
+That comment is worth keeping. The reactive swap is the payoff of the whole
+stream architecture, and it is the thing a marker is most likely to ask you to
+walk through.
+
+**Sign out** lives in the app bar:
+`onPressed: () => context.read<AuthViewModel>().logout()` — `read`, not
+`watch`, because a callback needs the object once and must not subscribe the
+widget to auth changes.
+
 # STEP 12 — Earnings (6 h)
 
 - [ ] **`EarningsRepository`** — thin view over Mervin's `WalletRepository`:
@@ -358,6 +1685,137 @@ easy to explain one at a time.
       `formatDateTime`; and a withdraw dialog validating against the available
       balance.
 - [ ] The withdrawal is simulated (no real payout) — say so in your user manual.
+
+### Code for step 12
+
+**`EarningsRepository` has no storage of its own** — it is a filtered view over
+Mervin's shared ledger, which is the whole idea:
+
+```dart
+class EarningsRepository {
+  final WalletRepository _wallet;
+
+  EarningsRepository({WalletRepository? wallet})
+      : _wallet = wallet ?? WalletRepository();
+
+  static const _types = [
+    AppConstants.txnEarning,
+    AppConstants.txnWithdrawal,
+    AppConstants.txnRefund,
+  ];
+
+  Stream<List<WalletTransaction>> watchEarnings(String vendorUid) {
+    return _wallet.watchTransactions(vendorUid, types: _types);
+  }
+
+  Future<void> withdraw(String vendorUid, int amountCents) {
+    return _wallet.withdraw(vendorUid, amountCents);
+  }
+}
+```
+
+`txnRefund` is in the list deliberately: when a customer's order is cancelled,
+the vendor's earning is clawed back as a refund entry, and a vendor who can't
+see those can't reconcile their balance.
+
+**`EarningsViewModel`** is the same shape as Mervin's `WalletViewModel` —
+`bool` return, friendly message, `finally` clearing the flag:
+
+```dart
+Future<bool> withdraw(String vendorUid, int amountCents) async {
+  _error = null;
+  _processing = true;
+  notifyListeners();
+  try {
+    await _repository.withdraw(vendorUid, amountCents);
+    return true;
+  } catch (e) {
+    _error = 'Withdrawal failed. Check your balance and try again.';
+    return false;
+  } finally {
+    _processing = false;
+    notifyListeners();
+  }
+}
+```
+
+`WalletRepository.withdraw` passes `requireFunds: true`, so an over-withdrawal
+throws `InsufficientBalanceException` inside the transaction and **nothing** is
+written — no balance change, no ledger row. Your catch turns that into a
+message; the guard itself is not your code and must not be duplicated here.
+
+**`vendor_earnings_page.dart` — the three summary figures** come from folding
+the ledger by type:
+
+```dart
+int _sumOf(List<WalletTransaction> txns, String type) => txns
+    .where((t) => t.type == type)
+    .fold(0, (acc, t) => acc + t.amount);
+
+final totalEarned = _sumOf(txns, AppConstants.txnEarning);
+final totalWithdrawn = _sumOf(txns, AppConstants.txnWithdrawal);
+```
+
+⚠️ **Available balance is *not* `totalEarned - totalWithdrawn`.** Read it from
+the vendor's user document via `AuthViewModel`, the same single source of
+truth the customer wallet uses. Deriving it from the ledger drifts the moment
+a refund or an admin adjustment lands, and then the vendor sees one number on
+this page and a different one when a withdrawal is rejected.
+
+**The 7-day chart** — bucket by calendar day, then render oldest-to-newest:
+
+```dart
+List<({DateTime day, int cents})> _lastSevenDays(List<WalletTransaction> txns) {
+  final today = DateTime.now();
+  return List.generate(7, (i) {
+    final day = DateTime(today.year, today.month, today.day)
+        .subtract(Duration(days: 6 - i));
+    final cents = txns
+        .where((t) =>
+            t.type == AppConstants.txnEarning &&
+            t.createdAt.year == day.year &&
+            t.createdAt.month == day.month &&
+            t.createdAt.day == day.day)
+        .fold(0, (acc, t) => acc + t.amount);
+    return (day: day, cents: cents);
+  });
+}
+```
+
+`List.generate` with `6 - i` gives you seven buckets in chronological order
+including empty days — a chart that silently omits a zero day misrepresents
+the trend. Feed these into `fl_chart`'s `BarChartGroupData`, converting cents
+to Ringgit (`cents / 100`) for the axis so the labels read as money.
+
+**The transaction list** signs the amount by type rather than storing negative
+values:
+
+```dart
+final isDebit = txn.type == AppConstants.txnWithdrawal;
+Text(
+  '${isDebit ? '-' : '+'}${centsToRM(txn.amount)}',
+  style: AppTextStyles.body.copyWith(
+    color: isDebit ? AppColors.error : AppColors.teal,
+  ),
+)
+```
+
+`WalletTransaction.amount` is always positive — direction lives in `type`.
+That is Mervin's convention from §0.3; respect it rather than storing signed
+amounts, or the two roles will disagree about what a ledger row means.
+
+**The withdraw dialog** validates against the available balance before
+calling the view model:
+
+```dart
+final cents = rmToCents(controller.text);
+if (cents == null || cents <= 0) return 'Enter a valid amount';
+if (cents > availableBalance) return 'You only have ${centsToRM(availableBalance)}';
+```
+
+This is a courtesy check for a better message — the authoritative rejection
+still happens inside the transaction. Say that if asked why you validate in
+two places.
 
 # STEP 13 — Your tests (5 h)
 
@@ -383,6 +1841,270 @@ Widget tests:
       no items, and a row per item when populated. Inject a fake VM.
 - [ ] `test/vendor/order_queue_page_test.dart` — an order card displays its
       pickup code and formatted total.
+
+### Code for step 13
+
+**A shared `order({...})` factory** at the top of each file keeps every test to
+the field it is actually about:
+
+```dart
+FoodOrder order({
+  required String id,
+  String status = 'preparing',
+  int vendorEarning = 630,
+  DateTime? createdAt,
+}) {
+  final created = createdAt ?? DateTime.now();
+  return FoodOrder(
+    orderId: id,
+    customerUid: 'cust1',
+    customerName: 'Alice',
+    stallId: 'stall1',
+    vendorUid: 'vend1',
+    stallName: 'Nasi Corner',
+    subtotal: 700,
+    serviceFee: 50,
+    total: 750,
+    commissionRate: 0.10,
+    vendorEarning: vendorEarning,
+    status: status,
+    pickupCode: 'A001',
+    createdAt: created,
+    updatedAt: created,
+  );
+}
+```
+
+**`test/vendor/menu_repository_test.dart`** — `MenuRepository(db: db)` with a
+`FakeFirebaseFirestore` is the entire setup. The id-round-trip test proves the
+convention from step 1:
+
+```dart
+test('addItem writes a document whose itemId matches its own id', () async {
+  final repo = MenuRepository(db: db);
+
+  final item = await repo.addItem(
+    stallId: 'stall1',
+    name: 'Fried Rice',
+    description: 'Wok-fried',
+    price: 800,
+    category: 'Mains',
+  );
+
+  final stored = await db
+      .collection('stalls').doc('stall1')
+      .collection('menuItems').doc(item.itemId)
+      .get();
+
+  expect(stored.exists, isTrue);
+  expect(stored.data()!['itemId'], item.itemId);
+  expect(stored.data()!['price'], 800);
+});
+```
+
+⚠️ The `setAvailable` test asserts on the fields it should **not** have
+touched — that is what makes it a test of the targeted `update` rather than
+just a test that the flag changed:
+
+```dart
+test('setAvailable flips only that field', () async {
+  final repo = MenuRepository(db: db);
+  final item = await repo.addItem(
+    stallId: 'stall1', name: 'Fried Rice', description: 'Wok-fried',
+    price: 800, category: 'Mains',
+  );
+
+  await repo.setAvailable('stall1', item.itemId, false);
+
+  final stored = await db
+      .collection('stalls').doc('stall1')
+      .collection('menuItems').doc(item.itemId)
+      .get();
+  expect(stored.data()!['available'], false);
+  expect(stored.data()!['name'], 'Fried Rice');
+  expect(stored.data()!['price'], 800);
+});
+```
+
+Plus `deleteItem` → `expect(stored.exists, isFalse)`.
+
+**`test/vendor/menu_management_vm_test.dart`** — the two rules for testing a
+stream-backed view model:
+
+```dart
+test('starts loading, emits items, then isLoading is false', () async {
+  final repo = MenuRepository(db: db);
+  await repo.addItem(
+    stallId: 'stall1', name: 'Fried Rice', description: '',
+    price: 800, category: 'Mains',
+  );
+
+  final vm = MenuManagementViewModel('stall1', repository: repo);
+  addTearDown(vm.dispose);
+  expect(vm.isLoading, isTrue);          // nothing has arrived yet
+
+  await Future<void>.delayed(Duration.zero);
+
+  expect(vm.isLoading, isFalse);
+  expect(vm.items, hasLength(1));
+  expect(vm.items.first.name, 'Fried Rice');
+});
+```
+
+⚠️ `addTearDown(vm.dispose)` on **every** view model you construct, and
+`await Future<void>.delayed(Duration.zero)` after constructing one. A view
+model that loads via a stream has loaded nothing at the moment its constructor
+returns; assert before the delay and you are testing the initial state, not
+the loaded one. Asserting `isLoading` is `true` *before* the delay is worth
+keeping — it proves the loading state exists at all.
+
+`toggleAvailable` is verified through Firestore, not through the view model,
+because the view model deliberately holds no local copy:
+
+```dart
+await vm.toggleAvailable(vm.items.first);
+await Future<void>.delayed(Duration.zero);
+
+final stored = await db
+    .collection('stalls').doc('stall1')
+    .collection('menuItems').doc(item.itemId).get();
+expect(stored.data()!['available'], false);
+```
+
+**`test/vendor/order_queue_vm_test.dart`** — seed four orders with deliberately
+shuffled timestamps so a passing test genuinely proves the sort:
+
+```dart
+test('splits into preparing and ready, each oldest-first', () async {
+  final base = DateTime.now().subtract(const Duration(minutes: 30));
+  final orders = [
+    order(id: 'p-new', createdAt: base.add(const Duration(minutes: 10))),
+    order(id: 'p-old', createdAt: base),
+    order(id: 'r-new', status: 'ready',
+        createdAt: base.add(const Duration(minutes: 15))),
+    order(id: 'r-old', status: 'ready',
+        createdAt: base.add(const Duration(minutes: 5))),
+  ];
+  for (final o in orders) {
+    await db.collection('orders').doc(o.orderId).set(o.toJson());
+  }
+
+  final vm = OrderQueueViewModel('vend1',
+      repository: VendorOrderRepository(db: db));
+  addTearDown(vm.dispose);
+  await Future<void>.delayed(Duration.zero);
+
+  expect(vm.preparing.map((o) => o.orderId), ['p-old', 'p-new']);
+  expect(vm.ready.map((o) => o.orderId), ['r-old', 'r-new']);
+});
+```
+
+Inserting `p-new` before `p-old` matters — seed them already in order and the
+assertion passes even with the sort deleted.
+
+**`test/vendor/vendor_dashboard_vm_test.dart`** — the bullet suggests
+constructing `FoodOrder`s directly, but the getters read `_orders`, which is
+private and stream-fed, so go through the fake anyway. It costs three extra
+lines:
+
+```dart
+test('todayOrderCount excludes cancelled and yesterday', () async {
+  final now = DateTime.now();
+  final orders = [
+    order(id: 'a', status: 'collected', createdAt: now),
+    order(id: 'b', status: 'cancelled', createdAt: now),
+    order(id: 'c', status: 'collected',
+        createdAt: now.subtract(const Duration(days: 1))),
+  ];
+  for (final o in orders) {
+    await db.collection('orders').doc(o.orderId).set(o.toJson());
+  }
+
+  final vm = VendorDashboardViewModel('vend1',
+      repository: VendorOrderRepository(db: db));
+  addTearDown(vm.dispose);
+  await Future<void>.delayed(Duration.zero);
+
+  expect(vm.todayOrderCount, 1);
+});
+
+test('todayEarnings sums the stored vendorEarning', () async {
+  final now = DateTime.now();
+  final orders = [
+    order(id: 'a', status: 'collected', vendorEarning: 630, createdAt: now),
+    order(id: 'b', status: 'collected', vendorEarning: 200, createdAt: now),
+    order(id: 'c', status: 'cancelled', vendorEarning: 999, createdAt: now),
+  ];
+  for (final o in orders) {
+    await db.collection('orders').doc(o.orderId).set(o.toJson());
+  }
+
+  final vm = VendorDashboardViewModel('vend1',
+      repository: VendorOrderRepository(db: db));
+  addTearDown(vm.dispose);
+  await Future<void>.delayed(Duration.zero);
+
+  expect(vm.todayEarnings, 630 + 200);
+});
+```
+
+The `vendorEarning: 999` on the cancelled order is the trap — it is a value no
+correct implementation can produce, so if it ever appears in the total you
+know cancelled orders leaked into the sum.
+
+> ⚠️ **`FakeFirebaseFirestore` does not enforce composite indexes.**
+> `watchVendorOrders` combines `where('vendorUid')` with
+> `orderBy('createdAt')`, which real Firestore rejects until the index in
+> `firestore.indexes.json` is deployed. Your tests will pass against a missing
+> index; the app will throw at runtime. Test the queue on a device too, and if
+> you see a `FAILED_PRECONDITION` with a console URL, that link creates the
+> index for you.
+
+**Widget tests.** Both pages read a view model from a provider, so inject a
+fake and let the test own disposal:
+
+```dart
+class FakeMenuVm extends ChangeNotifier implements MenuManagementViewModel {
+  FakeMenuVm(this._items);
+  final List<MenuItem> _items;
+
+  @override
+  List<MenuItem> get items => _items;
+  @override
+  bool get isLoading => false;
+  @override
+  String get stallId => 'stall1';
+
+  @override
+  noSuchMethod(Invocation i) => super.noSuchMethod(i);
+}
+
+Future<void> pumpMenu(WidgetTester tester, List<MenuItem> items) {
+  final vm = FakeMenuVm(items);
+  addTearDown(vm.dispose);
+  return tester.pumpWidget(
+    MaterialApp(
+      home: ChangeNotifierProvider<MenuManagementViewModel>.value(
+        value: vm,
+        child: const MenuManagementPage(stallId: 'stall1'),
+      ),
+    ),
+  );
+}
+```
+
+`implements` plus a `noSuchMethod` fallback means you override only the three
+members the widget reads instead of stubbing the whole class. Then
+`pumpMenu(tester, [])` finds `EmptyState`, and a two-item list finds two rows.
+
+For `order_queue_page_test.dart`, assert on the **formatted** money and that
+the raw cents are absent:
+
+```dart
+expect(find.text('#A001'), findsOneWidget);
+expect(find.text('RM 7.50'), findsOneWidget);
+expect(find.text('750'), findsNothing);
+```
 
 # STEP 14 — ⚠ iOS permission fix (0.5 h) — **assigned to you**
 

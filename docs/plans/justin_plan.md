@@ -2072,9 +2072,6 @@ class _AdminSettingsPageState extends State<AdminSettingsPage> {
 
 **Test only your own files.** Testing marks are per person.
 
-> Code snippets for this step are not included yet — they will be added
-> separately once the implementation steps above are built.
-
 `AdminDashboardViewModel`'s getters need **no Firestore mocking** — build a
 `List<FoodOrder>` in the test and assert. Easiest high-value tests in the app:
 
@@ -2101,6 +2098,280 @@ Widget tests:
       currency from an injected fake VM.
 - [ ] `test/admin/disputes_page_test.dart` — `EmptyState` with no disputes, and
       a card per open dispute.
+
+### Code for step 13
+
+**A shared `order({...})` factory** is what makes these tests short. Put one at
+the top of each file and vary only the field under test:
+
+```dart
+FoodOrder order({
+  String id = 'o1',
+  String stallName = 'Nasi Corner',
+  int total = 1000,
+  String status = 'collected',
+  bool refunded = false,
+  bool dismissed = false,
+  DateTime? createdAt,
+  DateTime? readyAt,
+}) {
+  final created = createdAt ?? DateTime.now();
+  return FoodOrder(
+    orderId: id,
+    customerUid: 'cust1',
+    customerName: 'Alice',
+    stallId: 'stall1',
+    vendorUid: 'vend1',
+    stallName: stallName,
+    subtotal: total - 50,
+    serviceFee: 50,
+    total: total,
+    status: status,
+    pickupCode: 'A001',
+    refunded: refunded,
+    dismissed: dismissed,
+    createdAt: created,
+    updatedAt: created,
+    readyAt: readyAt,
+  );
+}
+```
+
+**`test/admin/admin_dashboard_vm_test.dart`** — the view model opens two
+Firestore streams in its constructor, so pass a `FakeFirebaseFirestore`
+through `FirestoreService(db: db)` and seed the docs *before* constructing it:
+
+```dart
+late FakeFirebaseFirestore db;
+
+Future<AdminDashboardViewModel> vmWith(List<FoodOrder> orders) async {
+  for (final o in orders) {
+    await db.collection('orders').doc(o.orderId).set(o.toJson());
+  }
+  final vm = AdminDashboardViewModel(
+    firestore: FirestoreService(db: db),
+    stallRepository: AdminStallRepository(db: db),
+  );
+  addTearDown(vm.dispose);
+  await Future<void>.delayed(Duration.zero);   // let the streams deliver
+  return vm;
+}
+```
+
+⚠️ The `addTearDown(vm.dispose)` and the zero-delay are the same two rules
+used everywhere else in this project — a view model that loads via a stream
+has not loaded anything yet at the moment its constructor returns.
+
+The cancelled-exclusion case is the one that protects real money figures:
+
+```dart
+test('cancelled orders are excluded from every KPI', () async {
+  final vm = await vmWith([
+    order(id: 'a', total: 1000),
+    order(id: 'b', total: 2000, status: 'cancelled'),
+  ]);
+
+  expect(vm.totalOrders, 1);
+  expect(vm.revenue, 1000, reason: 'a cancelled order was refunded, so it is '
+      'not revenue — counting it inflates every report the admin exports');
+  expect(vm.ordersByHour.fold<int>(0, (a, b) => a + b), 1);
+  expect(vm.topStalls.length, 1);
+});
+```
+
+The remaining cases, each a few lines:
+
+```dart
+test('ordersByHour buckets by hour and always returns 24 entries', () async {
+  final today = DateTime.now();
+  final vm = await vmWith([
+    order(id: 'a', createdAt: DateTime(today.year, today.month, today.day, 9)),
+    order(id: 'b', createdAt: DateTime(today.year, today.month, today.day, 9)),
+    order(id: 'c', createdAt: DateTime(today.year, today.month, today.day, 14)),
+  ]);
+
+  expect(vm.ordersByHour.length, 24);
+  expect(vm.ordersByHour[9], 2);
+  expect(vm.ordersByHour[14], 1);
+  expect(vm.ordersByHour[0], 0);
+});
+
+test('topStalls sorts descending and caps at 5', () async {
+  final vm = await vmWith([
+    for (var i = 0; i < 6; i++)
+      for (var n = 0; n <= i; n++)
+        order(id: 's$i-$n', stallName: 'Stall $i'),
+  ]);
+
+  expect(vm.topStalls.length, 5, reason: 'the chart has room for five bars');
+  expect(vm.topStalls.first, ('Stall 5', 6));
+  expect(vm.topStalls.map((e) => e.$2).toList(), [6, 5, 4, 3, 2]);
+});
+
+test('avgPrepMinutes ignores orders that never reached ready', () async {
+  final base = DateTime.now().subtract(const Duration(minutes: 30));
+  final vm = await vmWith([
+    order(id: 'a', createdAt: base, readyAt: base.add(const Duration(minutes: 10))),
+    order(id: 'b', createdAt: base, readyAt: base.add(const Duration(minutes: 20))),
+    order(id: 'c', createdAt: base),                     // still preparing
+  ]);
+
+  expect(vm.avgPrepMinutes, 15);
+});
+```
+
+⚠️ **Keep the backdate small.** `DateRange.today` starts at midnight, so any
+order you backdate by hours will silently fall out of range when the suite
+runs shortly after midnight and the test fails for a reason that has nothing
+to do with the code. Anything that needs a genuinely older order should
+`setRange(DateRange.month)` first rather than backdating further.
+
+```dart
+
+test('avgPrepMinutes returns 0 rather than dividing by zero', () async {
+  final vm = await vmWith([order(id: 'a')]);
+  expect(vm.avgPrepMinutes, 0);
+});
+
+test('setRange changes which orders are counted', () async {
+  final vm = await vmWith([
+    order(id: 'today', createdAt: DateTime.now()),
+    order(id: 'old', createdAt: DateTime.now().subtract(const Duration(days: 10))),
+  ]);
+
+  expect(vm.totalOrders, 1);          // DateRange.today by default
+  vm.setRange(DateRange.month);
+  expect(vm.totalOrders, 2);
+});
+```
+
+**`test/admin/vendor_management_vm_test.dart`** — the assertion that matters is
+the *neither* case, because `rejected` is the one status that belongs in no
+bucket at all:
+
+```dart
+test('rejected stalls appear in neither bucket', () async {
+  final vm = await vmWith([
+    stall(id: 'a', status: 'pending'),
+    stall(id: 'b', status: 'open'),
+    stall(id: 'c', status: 'suspended'),
+    stall(id: 'd', status: 'rejected'),
+  ]);
+
+  expect(vm.pending.map((s) => s.stallId), ['a']);
+  expect(vm.managed.map((s) => s.stallId), ['b', 'c']);
+  expect(
+    [...vm.pending, ...vm.managed].map((s) => s.stallId),
+    isNot(contains('d')),
+    reason: 'a rejected stall is finished business — it must not reappear in '
+        'the approval queue',
+  );
+});
+```
+
+**`test/admin/disputes_vm_test.dart`** — all four flag combinations, since
+"open" is defined by two booleans being false together:
+
+```dart
+test('open vs resolved across every flag combination', () async {
+  final vm = await vmWith([
+    order(id: 'open', status: 'cancelled'),
+    order(id: 'refunded', status: 'cancelled', refunded: true),
+    order(id: 'dismissed', status: 'cancelled', dismissed: true),
+    order(id: 'both', status: 'cancelled', refunded: true, dismissed: true),
+  ]);
+
+  expect(vm.open.map((o) => o.orderId), ['open']);
+  expect(vm.resolved.map((o) => o.orderId),
+      containsAll(['refunded', 'dismissed', 'both']));
+});
+```
+
+**`test/admin/dispute_repository_test.dart`** — real `FakeFirebaseFirestore`,
+because this one moves money:
+
+```dart
+test('refund credits the exact total and writes one ledger row', () async {
+  await db.collection('users').doc('cust1').set({'walletBalance': 2000});
+  final o = order(status: 'cancelled', total: 1000);
+  await db.collection('orders').doc(o.orderId).set(o.toJson());
+
+  await repo.refund(o);
+
+  final user = await db.collection('users').doc('cust1').get();
+  expect(user.data()!['walletBalance'], 2000 + 1000);
+
+  final stored = await db.collection('orders').doc(o.orderId).get();
+  expect(stored.data()!['refunded'], true);
+
+  final ledger = await db.collection('transactions').get();
+  expect(ledger.docs, hasLength(1));
+  expect(ledger.docs.first.data()['balanceBefore'], 2000);
+  expect(ledger.docs.first.data()['balanceAfter'], 3000);
+  expect(ledger.docs.first.data()['amount'], 1000);
+});
+
+test('refunding twice credits only once', () async {
+  await db.collection('users').doc('cust1').set({'walletBalance': 2000});
+  final o = order(status: 'cancelled', total: 1000);
+  await db.collection('orders').doc(o.orderId).set(o.toJson());
+
+  await repo.refund(o);
+  await repo.refund(o.copyWith(refunded: true));
+
+  final user = await db.collection('users').doc('cust1').get();
+  expect(user.data()!['walletBalance'], 3000);
+  expect((await db.collection('transactions').get()).docs, hasLength(1));
+});
+```
+
+⚠️ The second test is guarding `if (order.refunded) return;` at the top of
+`refund`. Without it a double-tap on the refund button — or an admin returning
+to a stale disputes list — pays the customer twice from money the platform
+never took. Pass `o.copyWith(refunded: true)` to simulate the caller holding
+the *updated* order, which is what the stream would deliver.
+
+**Widget tests.** Both admin pages read their view model from a provider, so
+inject a fake and hand ownership of disposal to the test:
+
+```dart
+class FakeDisputesViewModel extends ChangeNotifier implements DisputesViewModel {
+  FakeDisputesViewModel(this._open);
+  final List<FoodOrder> _open;
+
+  @override
+  List<FoodOrder> get open => _open;
+  @override
+  List<FoodOrder> get resolved => const [];
+  @override
+  bool get isLoading => false;
+  @override
+  bool get isBusy => false;
+
+  @override
+  noSuchMethod(Invocation i) => super.noSuchMethod(i);
+}
+
+Future<void> pumpDisputes(WidgetTester tester, List<FoodOrder> open) {
+  final vm = FakeDisputesViewModel(open);
+  addTearDown(vm.dispose);
+  return tester.pumpWidget(
+    MaterialApp(
+      home: ChangeNotifierProvider<DisputesViewModel>.value(
+        value: vm,
+        child: const DisputesPage(),
+      ),
+    ),
+  );
+}
+```
+
+`implements` plus a `noSuchMethod` fallback means you only override the four
+getters the widget actually reads, instead of stubbing the whole class. Then:
+`pumpDisputes(tester, [])` finds `EmptyState`; `pumpDisputes(tester, [order(),
+order(id: 'o2')])` finds two cards. For the dashboard, assert on
+`find.text('RM 10.00')` and that `find.text('1000')` finds **nothing** — raw
+cents must never reach the screen.
 
 
 # STEP 14 — ⚠ Commission fix, **paired with Mervin** (5 h)
