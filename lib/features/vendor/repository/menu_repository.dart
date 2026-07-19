@@ -1,29 +1,24 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/menu_item.dart';
 
 /// CRUD for a stall's menu items at `stalls/{stallId}/menuItems/{itemId}`.
 class MenuRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  MenuRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  MenuRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String _path(String stallId) =>
-      '${AppConstants.stallsCollection}/$stallId/'
-      '${AppConstants.menuItemsSubcollection}';
-
-  CollectionReference<Map<String, dynamic>> _col(String stallId) =>
-      _db.collection(_path(stallId));
+  CollectionReference<Map<String, dynamic>> _col(String stallId) => _db
+      .collection(AppConstants.stallsCollection)
+      .doc(stallId)
+      .collection(AppConstants.menuItemsSubcollection);
 
   Stream<List<MenuItem>> watchMenuItems(String stallId) {
-    return _firestore
-        .collectionStream(_path(stallId))
-        .map((rows) => rows.map(MenuItem.fromJson).toList());
+    return _col(stallId).snapshots().map(
+          (snap) => snap.docs.map((d) => MenuItem.fromJson(d.data())).toList(),
+        );
   }
 
   Future<MenuItem> addItem({

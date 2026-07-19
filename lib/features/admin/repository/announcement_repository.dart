@@ -1,24 +1,24 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/announcement.dart';
 
 class AnnouncementRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  AnnouncementRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  AnnouncementRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
+
+  CollectionReference<Map<String, dynamic>> get _announcements =>
+      _db.collection(AppConstants.announcementsCollection);
 
   Stream<List<Announcement>> watchAnnouncements() {
-    return _firestore
-        .collectionStream(
-          AppConstants.announcementsCollection,
-          query: (q) => q.orderBy('createdAt', descending: true).limit(50),
-        )
-        .map((rows) => rows.map(Announcement.fromJson).toList());
+    return _announcements
+        .orderBy('createdAt', descending: true)
+        .limit(50)
+        .snapshots()
+        .map((snap) =>
+            snap.docs.map((d) => Announcement.fromJson(d.data())).toList());
   }
 
   Future<void> create({
@@ -26,7 +26,7 @@ class AnnouncementRepository {
     required String message,
     required String createdBy,
   }) async {
-    final ref = _db.collection(AppConstants.announcementsCollection).doc();
+    final ref = _announcements.doc();
     final announcement = Announcement(
       announcementId: ref.id,
       title: title,
@@ -38,9 +38,6 @@ class AnnouncementRepository {
   }
 
   Future<void> delete(String announcementId) {
-    return _db
-        .collection(AppConstants.announcementsCollection)
-        .doc(announcementId)
-        .delete();
+    return _announcements.doc(announcementId).delete();
   }
 }

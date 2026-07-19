@@ -1,8 +1,8 @@
 import 'dart:async';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/order.dart';
 import '../../../models/stall.dart';
@@ -13,10 +13,9 @@ enum DateRange { today, week, month }
 /// Aggregates orders and stalls into the admin KPI tiles, peak-hours chart,
 /// and top-stalls list, filtered by [DateRange].
 class AdminDashboardViewModel extends ChangeNotifier {
-  final FirestoreService _firestore;
   final AdminStallRepository _stallRepository;
 
-  StreamSubscription<List<Map<String, dynamic>>>? _ordersSub;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _ordersSub;
   StreamSubscription<List<Stall>>? _stallsSub;
 
   List<FoodOrder> _orders = [];
@@ -25,15 +24,14 @@ class AdminDashboardViewModel extends ChangeNotifier {
   DateRange _range = DateRange.today;
 
   AdminDashboardViewModel({
-    FirestoreService? firestore,
+    FirebaseFirestore? db,
     AdminStallRepository? stallRepository,
-  })  : _firestore = firestore ?? FirestoreService(),
-        _stallRepository = stallRepository ?? AdminStallRepository() {
-    _ordersSub = _firestore
-        .collectionStream(AppConstants.ordersCollection)
-        .listen(
-      (rows) {
-        _orders = rows.map(FoodOrder.fromJson).toList();
+  }) : _stallRepository = stallRepository ?? AdminStallRepository(db: db) {
+    final firestore = db ?? FirebaseFirestore.instance;
+    _ordersSub =
+        firestore.collection(AppConstants.ordersCollection).snapshots().listen(
+      (snap) {
+        _orders = snap.docs.map((d) => FoodOrder.fromJson(d.data())).toList();
         _loading = false;
         notifyListeners();
       },

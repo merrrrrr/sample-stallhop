@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/app_exceptions.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/transaction.dart';
@@ -9,11 +8,9 @@ import '../../../models/transaction.dart';
 /// a Firestore transaction so the balance and its ledger entry stay in sync.
 class WalletRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  WalletRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  WalletRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
   DocumentReference<Map<String, dynamic>> _userRef(String uid) =>
       _db.collection(AppConstants.usersCollection).doc(uid);
@@ -115,38 +112,33 @@ class WalletRepository {
     });
   }
 
+  /// A user's ledger entries, newest first, optionally narrowed to [types].
+  Query<Map<String, dynamic>> _ledgerQuery(String uid, List<String>? types) {
+    var query = _txns.where('userId', isEqualTo: uid);
+    if (types != null && types.isNotEmpty) {
+      query = query.where('type', whereIn: types);
+    }
+    return query.orderBy('createdAt', descending: true);
+  }
+
   Future<List<WalletTransaction>> getTransactions(
     String uid, {
     List<String>? types,
   }) async {
-    final rows = await _firestore.getCollection(
-      AppConstants.transactionsCollection,
-      query: (q) {
-        var query = q.where('userId', isEqualTo: uid);
-        if (types != null && types.isNotEmpty) {
-          query = query.where('type', whereIn: types);
-        }
-        return query.orderBy('createdAt', descending: true);
-      },
-    );
-    return rows.map(WalletTransaction.fromJson).toList();
+    final snap = await _ledgerQuery(uid, types).get();
+    return snap.docs
+        .map((d) => WalletTransaction.fromJson(d.data()))
+        .toList();
   }
 
   Stream<List<WalletTransaction>> watchTransactions(
     String uid, {
     List<String>? types,
   }) {
-    return _firestore
-        .collectionStream(
-          AppConstants.transactionsCollection,
-          query: (q) {
-            var query = q.where('userId', isEqualTo: uid);
-            if (types != null && types.isNotEmpty) {
-              query = query.where('type', whereIn: types);
-            }
-            return query.orderBy('createdAt', descending: true);
-          },
-        )
-        .map((rows) => rows.map(WalletTransaction.fromJson).toList());
+    return _ledgerQuery(uid, types).snapshots().map(
+          (snap) => snap.docs
+              .map((d) => WalletTransaction.fromJson(d.data()))
+              .toList(),
+        );
   }
 }

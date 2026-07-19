@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../services/firestore_service.dart';
 import '../utils/constants.dart';
 import '../../models/transaction.dart';
 import '../../models/venue_config.dart';
@@ -12,50 +11,43 @@ import '../../models/venue_config.dart';
 /// it — pricing resolves the venue commission and service fee from here — even
 /// though only an admin writes it.
 class VenueConfigRepository {
-  final FirestoreService _firestore;
+  final FirebaseFirestore _db;
 
-  VenueConfigRepository({FirestoreService? firestore})
-      : _firestore = firestore ?? FirestoreService();
+  VenueConfigRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String get _path =>
-      '${AppConstants.configCollection}/${AppConstants.venueConfigDoc}';
+  DocumentReference<Map<String, dynamic>> get _doc => _db
+      .collection(AppConstants.configCollection)
+      .doc(AppConstants.venueConfigDoc);
 
   Stream<VenueConfig?> watchConfig() {
-    return _firestore
-        .documentStream(_path)
-        .map((data) => data == null ? null : VenueConfig.fromJson(data));
+    return _doc.snapshots().map(
+          (snap) => snap.data() == null ? null : VenueConfig.fromJson(snap.data()!),
+        );
   }
 
   Future<void> updateCommission(double rate) {
-    return _firestore.setDocument(
-      _path,
-      {
-        'defaultCommission': rate,
-        'updatedAt': Timestamp.fromDate(DateTime.now()),
-      },
-      merge: true,
-    );
+    return _doc.set({
+      'defaultCommission': rate,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    }, SetOptions(merge: true));
   }
 
   Future<void> updateServiceFee(int cents) {
-    return _firestore.setDocument(
-      _path,
-      {
-        'serviceFee': cents,
-        'updatedAt': Timestamp.fromDate(DateTime.now()),
-      },
-      merge: true,
-    );
+    return _doc.set({
+      'serviceFee': cents,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    }, SetOptions(merge: true));
   }
 
   /// Total amount ever topped up across all users, in cents.
   Future<int> totalTopUps() async {
-    final rows = await _firestore.getCollection(
-      AppConstants.transactionsCollection,
-      query: (q) => q.where('type', isEqualTo: AppConstants.txnTopUp),
-    );
-    return rows
-        .map(WalletTransaction.fromJson)
+    final snap = await _db
+        .collection(AppConstants.transactionsCollection)
+        .where('type', isEqualTo: AppConstants.txnTopUp)
+        .get();
+    return snap.docs
+        .map((d) => WalletTransaction.fromJson(d.data()))
         .fold<int>(0, (acc, t) => acc + t.amount);
   }
 }

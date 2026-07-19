@@ -3,8 +3,18 @@
 **Total estimate: ~50 h** (plus ~5 h paired with Mervin on the commission fix).
 
 Work strictly top to bottom — every step only uses things built in earlier
-steps. Phase 0 must be merged and you must have completed Mervin's teaching
-session (the menu-management walkthrough) before you start step 1.
+steps.
+
+**When you can start:** you do **not** need all of Phase 0. You need Mervin's
+§0.1–§0.4 merged — `AppConstants`, the theme, `formatters.dart`,
+`Validators`, `lib/models/`, and `lib/widgets/` — which is the milestone he
+marks as **§0.4a**, about 16 h into his work rather than 25 h. The teaching
+session happens there too.
+
+Auth, security rules and seed data (his §0.5–§0.7) land while you are already
+building; nothing in steps 1 and 4 touches them, because your stub ViewModels
+do not talk to Firestore at all. Do not wait for the full Phase 0 merge — that
+would idle you for an extra week for no reason.
 
 **The rule:** never copy-paste from the reference repo. Read a file, close it,
 type your own. If you can't explain a line in the Q&A, it shouldn't be in your
@@ -55,7 +65,7 @@ lib/features/admin/
 | What | Where | What you call |
 |---|---|---|
 | `Stall`, `FoodOrder`, `Announcement`, `VenueConfig`, `WalletTransaction` | `lib/models/` | `fromJson` / `toJson` |
-| `FirestoreService` | `core/services/` | `collectionStream`, `getCollection`, `setDocument` |
+| `cloud_firestore` directly | — | `_db.collection(...).snapshots()` / `.get()` — there is no wrapper service |
 | `EmptyState`, `LoadingIndicator` | `widgets/` | every list screen |
 | `centsToRM`, `formatDate`, `timeAgo` | `core/utils/formatters.dart` | all money and dates |
 | `AppConstants` | `core/utils/constants.dart` | never type a collection name yourself |
@@ -67,178 +77,88 @@ security-rules consequence (only an admin may run them), which Mervin handles in
 
 ---
 
-# STEP 1 — `AdminStallRepository` (2 h)
+## How you build each slice: stub → UI → repository → real VM
 
-`lib/features/admin/repository/admin_stall_repository.dart`
+Your work is grouped into four **slices**. Three of them are built UI-first:
 
-**What it does:** the admin's control over the stall lifecycle. It reads every
-stall in the venue and changes their `status` field. It's small — five short
-methods — so it's a good first file.
+| Slice | Steps | Order |
+|---|---|---|
+| Vendors | 1–3 | stub VM → page → repository → real VM |
+| Announcements | 4–6 | stub VM → page → repository → real VM |
+| **Disputes** | 7–9 | **repository → VM → page** (money — see below) |
+| Dashboard | 10–11 | stub VM → page → real VM |
 
-**The stall lifecycle** (memorise this; it's the heart of your role):
-
-```
-  vendor creates  →  pending  ──approve──►  open  ⇄  closed   (vendor toggles)
-                        │                    │
-                     reject               suspend
-                        ▼                    ▼
-                    rejected             suspended ──reactivate──► closed
-```
-
-Reactivate goes to `closed`, **not** `open` — the stall comes back off-suspension
-but the vendor decides when to actually open for business. Be ready to explain
-that choice; it's a deliberate design decision, not an oversight.
-
-- [ ] Constructor takes optional `FirebaseFirestore? db` and
-      `FirestoreService? firestore`, each falling back to a real instance.
-      **This is what makes your tests possible in step 13** — don't skip it.
-- [ ] `Stream<List<Stall>> watchAllStalls()` —
-      `_firestore.collectionStream(AppConstants.stallsCollection)
-      .map((rows) => rows.map(Stall.fromJson).toList())`. Unfiltered: the admin
-      sees every stall in every state.
-- [ ] A private `Future<void> _setStatus(String stallId, String status)` doing
-      the `update` with `status` and `updatedAt`.
-- [ ] Four one-line public methods over it: `approve` → `stallOpen`,
-      `reject` → `stallRejected`, `suspend` → `stallSuspended`,
-      `reactivate` → `stallClosed`. *Why four named methods instead of one
-      `setStatus`?* Because the call sites then read as intent
-      (`repo.approve(id)`) and you can't accidentally pass an invalid status
-      string.
-
-**`lib/features/admin/repository/admin_stall_repository.dart`**
+**The stub ViewModel is the whole trick.** Before you build a page, spend
+fifteen minutes writing a ViewModel with the *real* class name, the *real*
+getters and the *real* method signatures — but hardcoded data inside and no
+Firestore at all:
 
 ```dart
-import 'package:cloud_firestore/cloud_firestore.dart';
-
-import '../../../core/services/firestore_service.dart';
-import '../../../core/utils/constants.dart';
-import '../../../models/stall.dart';
-
-/// Admin control over stall lifecycle: approve, reject, suspend, reactivate.
-class AdminStallRepository {
-  final FirebaseFirestore _db;
-  final FirestoreService _firestore;
-
-  AdminStallRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
-
-  CollectionReference<Map<String, dynamic>> get _stalls =>
-      _db.collection(AppConstants.stallsCollection);
-
-  Stream<List<Stall>> watchAllStalls() {
-    return _firestore
-        .collectionStream(AppConstants.stallsCollection)
-        .map((rows) => rows.map(Stall.fromJson).toList());
-  }
-
-  Future<void> _setStatus(String stallId, String status) {
-    return _stalls.doc(stallId).update({
-      'status': status,
-      'updatedAt': Timestamp.fromDate(DateTime.now()),
-    });
-  }
-
-  Future<void> approve(String stallId) =>
-      _setStatus(stallId, AppConstants.stallOpen);
-
-  Future<void> reject(String stallId) =>
-      _setStatus(stallId, AppConstants.stallRejected);
-
-  Future<void> suspend(String stallId) =>
-      _setStatus(stallId, AppConstants.stallSuspended);
-
-  Future<void> reactivate(String stallId) =>
-      _setStatus(stallId, AppConstants.stallClosed);
-}
-```
-
-# STEP 2 — `VendorManagementViewModel` (2 h)
-
-`lib/features/admin/view_model/vendor_management_vm.dart`
-
-- [ ] Subscribes to `watchAllStalls()` in the constructor. Holds
-      `List<Stall> _stalls` and `bool _loading`.
-- [ ] **`onError` handler on the `.listen()`** — `debugPrint`, set
-      `_loading = false`, `notifyListeners()`. Without it a permission error
-      leaves the screen spinning forever with no clue why. This is the most
-      common bug you will hit.
-- [ ] Two computed getters splitting the one list:
-      - `pending` — status `pending`. These need an approve/reject decision.
-      - `managed` — status in `[open, closed, suspended]`. Already-approved
-        stalls the admin can suspend or restore.
-      Note `rejected` stalls appear in **neither** — they're archived.
-- [ ] Passthroughs: `approve(stall)`, `reject(stall)`, `suspend(stall)`,
-      `reactivate(stall)`.
-- [ ] `dispose()` → `_sub?.cancel()`.
-
-**`lib/features/admin/view_model/vendor_management_vm.dart`**
-
-```dart
-import 'dart:async';
-
-import 'package:flutter/foundation.dart';
-
-import '../../../core/utils/constants.dart';
-import '../../../models/stall.dart';
-import '../repository/admin_stall_repository.dart';
-
-/// Splits stalls into pending-approval and active/managed buckets.
+/// STUB — delete the fake list in step 3, keep everything else.
 class VendorManagementViewModel extends ChangeNotifier {
-  final AdminStallRepository _repository;
-  StreamSubscription<List<Stall>>? _sub;
+  final List<Stall> _fake = [
+    Stall(stallId: 's1', name: 'Nasi Lemak Corner', status: AppConstants.stallPending, /* ... */),
+    Stall(stallId: 's2', name: 'Wan Tan Mee',       status: AppConstants.stallOpen,    /* ... */),
+    Stall(stallId: 's3', name: 'Roti Canai Bakar',  status: AppConstants.stallSuspended, /* ... */),
+  ];
 
-  List<Stall> _stalls = [];
-  bool _loading = true;
+  bool get isLoading => false;          // flip to true by hand to check your spinner
 
-  VendorManagementViewModel({AdminStallRepository? repository})
-      : _repository = repository ?? AdminStallRepository() {
-    _sub = _repository.watchAllStalls().listen(
-      (stalls) {
-        _stalls = stalls;
-        _loading = false;
-        notifyListeners();
-      },
-      onError: (Object e) {
-        debugPrint('VendorManagementViewModel stream error: $e');
-        _loading = false;
-        notifyListeners();
-      },
-    );
-  }
-
-  bool get isLoading => _loading;
-
-  List<Stall> get pending => _stalls
-      .where((s) => s.status == AppConstants.stallPending)
+  List<Stall> get pending =>
+      _fake.where((s) => s.status == AppConstants.stallPending).toList();
+  List<Stall> get managed => _fake
+      .where((s) => s.status != AppConstants.stallPending &&
+                    s.status != AppConstants.stallRejected)
       .toList();
 
-  /// Approved stalls (open/closed) plus suspended ones the admin can restore.
-  List<Stall> get managed => _stalls
-      .where((s) => const [
-            AppConstants.stallOpen,
-            AppConstants.stallClosed,
-            AppConstants.stallSuspended,
-          ].contains(s.status))
-      .toList();
-
-  Future<void> approve(Stall stall) => _repository.approve(stall.stallId);
-  Future<void> reject(Stall stall) => _repository.reject(stall.stallId);
-  Future<void> suspend(Stall stall) => _repository.suspend(stall.stallId);
-  Future<void> reactivate(Stall stall) =>
-      _repository.reactivate(stall.stallId);
-
-  @override
-  void dispose() {
-    _sub?.cancel();
-    super.dispose();
-  }
+  Future<void> approve(Stall s) async {}    // no-ops for now
+  Future<void> reject(Stall s) async {}
+  Future<void> suspend(Stall s) async {}
+  Future<void> reactivate(Stall s) async {}
 }
 ```
 
-# STEP 3 — `vendor_management_page.dart` (6 h)
+Why this and not a hardcoded `List` inside the widget:
+
+- The page you write against this stub is the **final** page. When step 3
+  replaces the stub with the real stream-backed ViewModel, the page does not
+  change at all — same `context.watch<VendorManagementViewModel>()`, same
+  getters. That is the difference between *integrating* and *rewriting*.
+- It forces you to design the VM's API before you need its implementation,
+  which is the part that is hard to change later.
+- No Firebase, no emulator, no seed data. Hot reload is instant, so the 12 h
+  dashboard is 12 h of actual layout work rather than waiting on queries.
+- Give the stub `isLoading`, an empty-list case and an error case from day one.
+  Flip them by hand and check the page renders `LoadingIndicator` and
+  `EmptyState` properly. Pages built on always-present fake data are exactly
+  the pages that have no loading state when the real stream arrives.
+
+**Delete the stub in the same commit that adds the real ViewModel.** A stub
+that survives into the final submission is a bug and an obvious Q&A target.
+
+### The exception: money is built logic-first
+
+The disputes slice (steps 7–9) runs the other way round — repository, then
+ViewModel, then page — because `DisputeRepository.refund` is the only place in
+your role that writes money, and it writes it inside a Firestore transaction.
+That code gets written and **unit-tested against `fake_cloud_firestore` before
+any UI exists**, because a wrong refund amount discovered during a late
+integration crunch is the one failure here you cannot recover from in a demo.
+The same rule applies to step 14's commission fix.
+
+Everywhere else the UI is the risky, slow, fiddly part and the logic is simple,
+so UI goes first.
+
+---
+
+# STEP 1 — `vendor_management_page.dart` (6 h)
 
 `lib/features/admin/view/vendor_management_page.dart`
+
+> **Stub first (15 min).** Write `VendorManagementViewModel` as the stub shown
+> in "How you build each slice" above, then build this entire page against it.
+> No Firestore, no emulator — just hot reload. Steps 2 and 3 replace the stub's
+> internals; this file will not change when they do.
 
 - [ ] `DefaultTabController` with two tabs: "Pending" (with a badge showing
       `vm.pending.length` — this is an action queue) and "All stalls".
@@ -444,138 +364,205 @@ class _ManagedTile extends StatelessWidget {
 }
 ```
 
-# STEP 4 — `AnnouncementRepository` (2 h)
+# STEP 2 — `AdminStallRepository` (2 h)
 
-`lib/features/admin/repository/announcement_repository.dart`
+`lib/features/admin/repository/admin_stall_repository.dart`
 
-- [ ] `watchAnnouncements()` — `announcements` ordered by `createdAt`
-      descending, `.limit(50)`. The limit matters: without it the query grows
-      unbounded over the venue's lifetime.
-- [ ] `create({title, message, createdBy})` — generate the doc id first, build
-      an `Announcement` with `createdAt: DateTime.now()`, then `set`.
-      `createdBy` is the admin's uid, which Mervin's `NotificationCoordinator`
-      uses to avoid notifying the author about their own announcement.
-- [ ] `delete(announcementId)`
+**What it does:** the admin's control over the stall lifecycle. It reads every
+stall in the venue and changes their `status` field. It's small — five short
+methods — so it's a gentle first repository, and you already know exactly what
+it has to provide because step 1's page has been calling the stubbed version of
+it all week.
 
-**`lib/features/admin/repository/announcement_repository.dart`**
+**The stall lifecycle** (memorise this; it's the heart of your role):
+
+```
+  vendor creates  →  pending  ──approve──►  open  ⇄  closed   (vendor toggles)
+                        │                    │
+                     reject               suspend
+                        ▼                    ▼
+                    rejected             suspended ──reactivate──► closed
+```
+
+Reactivate goes to `closed`, **not** `open` — the stall comes back off-suspension
+but the vendor decides when to actually open for business. Be ready to explain
+that choice; it's a deliberate design decision, not an oversight.
+
+- [ ] Constructor takes an optional `FirebaseFirestore? db` falling back to
+      `FirebaseFirestore.instance`. **This is what makes your tests possible in
+      step 13** — don't skip it. Every repository in the app has this one
+      parameter and nothing else.
+- [ ] `Stream<List<Stall>> watchAllStalls()` — `_stalls.snapshots()` mapped
+      through `Stall.fromJson(d.data())`. Unfiltered: the admin sees every
+      stall in every state.
+- [ ] A private `Future<void> _setStatus(String stallId, String status)` doing
+      the `update` with `status` and `updatedAt`.
+- [ ] Four one-line public methods over it: `approve` → `stallOpen`,
+      `reject` → `stallRejected`, `suspend` → `stallSuspended`,
+      `reactivate` → `stallClosed`. *Why four named methods instead of one
+      `setStatus`?* Because the call sites then read as intent
+      (`repo.approve(id)`) and you can't accidentally pass an invalid status
+      string.
+
+**`lib/features/admin/repository/admin_stall_repository.dart`**
 
 ```dart
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
-import '../../../models/announcement.dart';
+import '../../../models/stall.dart';
 
-class AnnouncementRepository {
+/// Admin control over stall lifecycle: approve, reject, suspend, reactivate.
+class AdminStallRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  AnnouncementRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  AdminStallRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  Stream<List<Announcement>> watchAnnouncements() {
-    return _firestore
-        .collectionStream(
-          AppConstants.announcementsCollection,
-          query: (q) => q.orderBy('createdAt', descending: true).limit(50),
-        )
-        .map((rows) => rows.map(Announcement.fromJson).toList());
+  CollectionReference<Map<String, dynamic>> get _stalls =>
+      _db.collection(AppConstants.stallsCollection);
+
+  Stream<List<Stall>> watchAllStalls() {
+    return _stalls.snapshots().map(
+          (snap) => snap.docs.map((d) => Stall.fromJson(d.data())).toList(),
+        );
   }
 
-  Future<void> create({
-    required String title,
-    required String message,
-    required String createdBy,
-  }) async {
-    final ref = _db.collection(AppConstants.announcementsCollection).doc();
-    final announcement = Announcement(
-      announcementId: ref.id,
-      title: title,
-      message: message,
-      createdBy: createdBy,
-      createdAt: DateTime.now(),
-    );
-    await ref.set(announcement.toJson());
+  Future<void> _setStatus(String stallId, String status) {
+    return _stalls.doc(stallId).update({
+      'status': status,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    });
   }
 
-  Future<void> delete(String announcementId) {
-    return _db
-        .collection(AppConstants.announcementsCollection)
-        .doc(announcementId)
-        .delete();
-  }
+  Future<void> approve(String stallId) =>
+      _setStatus(stallId, AppConstants.stallOpen);
+
+  Future<void> reject(String stallId) =>
+      _setStatus(stallId, AppConstants.stallRejected);
+
+  Future<void> suspend(String stallId) =>
+      _setStatus(stallId, AppConstants.stallSuspended);
+
+  Future<void> reactivate(String stallId) =>
+      _setStatus(stallId, AppConstants.stallClosed);
 }
 ```
 
-# STEP 5 — `AnnouncementsViewModel` (1.5 h)
+# STEP 3 — `VendorManagementViewModel` (2 h)
 
-`lib/features/admin/view_model/announcements_vm.dart`
+`lib/features/admin/view_model/vendor_management_vm.dart`
 
-- [ ] Exposes `Stream<List<Announcement>> get announcements` directly from the
-      repository (a `StreamBuilder` in the view consumes it) — note this VM
-      does **not** hold a subscription, unlike your others. Simpler is fine
-      here because there's no derived state; be able to say why the two
-      patterns differ.
-- [ ] `publish({title, message, createdBy})` with `_sending` and `_error`
-      state; trims the inputs; returns `bool`. Catch the exception and set a
-      friendly message rather than letting it reach the UI.
-- [ ] `delete(id)`.
+> **This replaces your stub.** Same class name, same getters (`isLoading`,
+> `pending`, `managed`), same four methods — only the insides change, from a
+> hardcoded list to a live subscription. `vendor_management_page.dart` should
+> need **zero** edits. If it needs any, note what and why: that difference is
+> the thing you got wrong in your stub's API, and it is worth saying out loud
+> in the Q&A.
 
-**`lib/features/admin/view_model/announcements_vm.dart`**
+- [ ] Subscribes to `watchAllStalls()` in the constructor. Holds
+      `List<Stall> _stalls` and `bool _loading`.
+- [ ] **`onError` handler on the `.listen()`** — `debugPrint`, set
+      `_loading = false`, `notifyListeners()`. Without it a permission error
+      leaves the screen spinning forever with no clue why. This is the most
+      common bug you will hit.
+- [ ] Two computed getters splitting the one list:
+      - `pending` — status `pending`. These need an approve/reject decision.
+      - `managed` — status in `[open, closed, suspended]`. Already-approved
+        stalls the admin can suspend or restore.
+      Note `rejected` stalls appear in **neither** — they're archived.
+- [ ] Passthroughs: `approve(stall)`, `reject(stall)`, `suspend(stall)`,
+      `reactivate(stall)`.
+- [ ] `dispose()` → `_sub?.cancel()`.
+- [ ] **Delete the stub file in this same commit.** Nothing should ship with
+      two definitions of this class.
+
+**Wire and verify before moving on (do not batch this up):**
+
+- [ ] Seeded stalls actually appear, in the right tab, from Firestore.
+- [ ] Approve a stall → the row moves from Pending to All stalls **by itself**,
+      because the stream re-fires. You are not calling `setState` anywhere.
+- [ ] Kill your network / break a rule deliberately → the spinner stops and you
+      get a `debugPrint`, rather than spinning forever. This is the `onError`
+      path and it is the bug the stub cannot teach you about.
+- [ ] Empty collection → `EmptyState` renders, not a blank screen.
+
+**`lib/features/admin/view_model/vendor_management_vm.dart`**
 
 ```dart
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
-import '../../../models/announcement.dart';
-import '../repository/announcement_repository.dart';
+import '../../../core/utils/constants.dart';
+import '../../../models/stall.dart';
+import '../repository/admin_stall_repository.dart';
 
-class AnnouncementsViewModel extends ChangeNotifier {
-  final AnnouncementRepository _repository;
+/// Splits stalls into pending-approval and active/managed buckets.
+class VendorManagementViewModel extends ChangeNotifier {
+  final AdminStallRepository _repository;
+  StreamSubscription<List<Stall>>? _sub;
 
-  AnnouncementsViewModel({AnnouncementRepository? repository})
-      : _repository = repository ?? AnnouncementRepository();
+  List<Stall> _stalls = [];
+  bool _loading = true;
 
-  bool _sending = false;
-  String? _error;
-
-  bool get isSending => _sending;
-  String? get error => _error;
-
-  Stream<List<Announcement>> get announcements =>
-      _repository.watchAnnouncements();
-
-  Future<bool> publish({
-    required String title,
-    required String message,
-    required String createdBy,
-  }) async {
-    _error = null;
-    _sending = true;
-    notifyListeners();
-    try {
-      await _repository.create(
-        title: title.trim(),
-        message: message.trim(),
-        createdBy: createdBy,
-      );
-      return true;
-    } catch (e) {
-      _error = 'Could not publish announcement.';
-      return false;
-    } finally {
-      _sending = false;
-      notifyListeners();
-    }
+  VendorManagementViewModel({AdminStallRepository? repository})
+      : _repository = repository ?? AdminStallRepository() {
+    _sub = _repository.watchAllStalls().listen(
+      (stalls) {
+        _stalls = stalls;
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('VendorManagementViewModel stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
   }
 
-  Future<void> delete(String id) => _repository.delete(id);
+  bool get isLoading => _loading;
+
+  List<Stall> get pending => _stalls
+      .where((s) => s.status == AppConstants.stallPending)
+      .toList();
+
+  /// Approved stalls (open/closed) plus suspended ones the admin can restore.
+  List<Stall> get managed => _stalls
+      .where((s) => const [
+            AppConstants.stallOpen,
+            AppConstants.stallClosed,
+            AppConstants.stallSuspended,
+          ].contains(s.status))
+      .toList();
+
+  Future<void> approve(Stall stall) => _repository.approve(stall.stallId);
+  Future<void> reject(Stall stall) => _repository.reject(stall.stallId);
+  Future<void> suspend(Stall stall) => _repository.suspend(stall.stallId);
+  Future<void> reactivate(Stall stall) =>
+      _repository.reactivate(stall.stallId);
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
 }
 ```
 
-# STEP 6 — `announcements_page.dart` (5 h)
+# STEP 4 — `announcements_page.dart` (5 h)
 
 `lib/features/admin/view/announcements_page.dart`
+
+> **Stub first (15 min).** Write `AnnouncementsViewModel` with the real shape —
+> `Stream<List<Announcement>> get announcements => Stream.value([...two fakes...])`,
+> plus `isSending`, `error`, a `publish(...)` that just returns `true`, and a
+> no-op `delete(id)`. Note this VM exposes a **stream**, not a list, because the
+> view drives it with a `StreamBuilder` (see step 6 for why this one differs
+> from your others) — so stub it as a stream too, or the page you write here
+> will not match the real thing. Use `Stream.empty()` briefly to confirm your
+> `EmptyState` renders.
 
 - [ ] `StreamBuilder<List<Announcement>>` over `vm.announcements` with the
       three states: loading → `LoadingIndicator`, empty → `EmptyState`,
@@ -747,6 +734,137 @@ class _AnnouncementsViewState extends State<_AnnouncementsView> {
 }
 ```
 
+# STEP 5 — `AnnouncementRepository` (2 h)
+
+`lib/features/admin/repository/announcement_repository.dart`
+
+- [ ] `watchAnnouncements()` — `announcements` ordered by `createdAt`
+      descending, `.limit(50)`. The limit matters: without it the query grows
+      unbounded over the venue's lifetime.
+- [ ] `create({title, message, createdBy})` — generate the doc id first, build
+      an `Announcement` with `createdAt: DateTime.now()`, then `set`.
+      `createdBy` is the admin's uid, which Mervin's `NotificationCoordinator`
+      uses to avoid notifying the author about their own announcement.
+- [ ] `delete(announcementId)`
+
+**`lib/features/admin/repository/announcement_repository.dart`**
+
+```dart
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+import '../../../core/utils/constants.dart';
+import '../../../models/announcement.dart';
+
+class AnnouncementRepository {
+  final FirebaseFirestore _db;
+
+  AnnouncementRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
+
+  CollectionReference<Map<String, dynamic>> get _announcements =>
+      _db.collection(AppConstants.announcementsCollection);
+
+  Stream<List<Announcement>> watchAnnouncements() {
+    return _announcements
+        .orderBy('createdAt', descending: true)
+        .limit(50)
+        .snapshots()
+        .map((snap) =>
+            snap.docs.map((d) => Announcement.fromJson(d.data())).toList());
+  }
+
+  Future<void> create({
+    required String title,
+    required String message,
+    required String createdBy,
+  }) async {
+    final ref = _announcements.doc();
+    final announcement = Announcement(
+      announcementId: ref.id,
+      title: title,
+      message: message,
+      createdBy: createdBy,
+      createdAt: DateTime.now(),
+    );
+    await ref.set(announcement.toJson());
+  }
+
+  Future<void> delete(String announcementId) {
+    return _announcements.doc(announcementId).delete();
+  }
+}
+```
+
+# STEP 6 — `AnnouncementsViewModel` (1.5 h)
+
+`lib/features/admin/view_model/announcements_vm.dart`
+
+> **This replaces your stub.** The stub already returned a
+> `Stream<List<Announcement>>` (via `Stream.value`); here it becomes the
+> repository's real stream. `announcements_page.dart` should need zero edits.
+> Delete the stub in this commit.
+
+- [ ] Exposes `Stream<List<Announcement>> get announcements` directly from the
+      repository (a `StreamBuilder` in the view consumes it) — note this VM
+      does **not** hold a subscription, unlike your others. Simpler is fine
+      here because there's no derived state; be able to say why the two
+      patterns differ.
+- [ ] `publish({title, message, createdBy})` with `_sending` and `_error`
+      state; trims the inputs; returns `bool`. Catch the exception and set a
+      friendly message rather than letting it reach the UI.
+- [ ] `delete(id)`.
+
+**`lib/features/admin/view_model/announcements_vm.dart`**
+
+```dart
+import 'package:flutter/foundation.dart';
+
+import '../../../models/announcement.dart';
+import '../repository/announcement_repository.dart';
+
+class AnnouncementsViewModel extends ChangeNotifier {
+  final AnnouncementRepository _repository;
+
+  AnnouncementsViewModel({AnnouncementRepository? repository})
+      : _repository = repository ?? AnnouncementRepository();
+
+  bool _sending = false;
+  String? _error;
+
+  bool get isSending => _sending;
+  String? get error => _error;
+
+  Stream<List<Announcement>> get announcements =>
+      _repository.watchAnnouncements();
+
+  Future<bool> publish({
+    required String title,
+    required String message,
+    required String createdBy,
+  }) async {
+    _error = null;
+    _sending = true;
+    notifyListeners();
+    try {
+      await _repository.create(
+        title: title.trim(),
+        message: message.trim(),
+        createdBy: createdBy,
+      );
+      return true;
+    } catch (e) {
+      _error = 'Could not publish announcement.';
+      return false;
+    } finally {
+      _sending = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> delete(String id) => _repository.delete(id);
+}
+```
+
 # STEP 7 — `DisputeRepository` (4 h) — ⚠ the only place you write money
 
 `repository/dispute_repository.dart`
@@ -796,7 +914,6 @@ order cancelled  →  refunded == false && dismissed == false  →  OPEN
 ```dart
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/order.dart';
 import '../../../models/transaction.dart';
@@ -805,22 +922,21 @@ import '../../../models/transaction.dart';
 /// refunded nor dismissed by an admin.
 class DisputeRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  DisputeRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  DisputeRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
+
+  CollectionReference<Map<String, dynamic>> get _orders =>
+      _db.collection(AppConstants.ordersCollection);
 
   /// All cancelled orders; the view model splits them into open/resolved.
   Stream<List<FoodOrder>> watchCancelledOrders() {
-    return _firestore
-        .collectionStream(
-          AppConstants.ordersCollection,
-          query: (q) => q
-              .where('status', isEqualTo: AppConstants.orderCancelled)
-              .orderBy('createdAt', descending: true),
-        )
-        .map((rows) => rows.map(FoodOrder.fromJson).toList());
+    return _orders
+        .where('status', isEqualTo: AppConstants.orderCancelled)
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snap) =>
+            snap.docs.map((d) => FoodOrder.fromJson(d.data())).toList());
   }
 
   /// Credits the customer the full order total and marks the order refunded,
@@ -829,8 +945,7 @@ class DisputeRepository {
     if (order.refunded) return;
     final now = DateTime.now();
     await _db.runTransaction((txn) async {
-      final orderRef =
-          _db.collection(AppConstants.ordersCollection).doc(order.orderId);
+      final orderRef = _orders.doc(order.orderId);
       final customerRef =
           _db.collection(AppConstants.usersCollection).doc(order.customerUid);
 
@@ -868,10 +983,7 @@ class DisputeRepository {
 
   /// Resolves the dispute without refunding.
   Future<void> dismiss(FoodOrder order) {
-    return _db
-        .collection(AppConstants.ordersCollection)
-        .doc(order.orderId)
-        .update({
+    return _orders.doc(order.orderId).update({
       'dismissed': true,
       'updatedAt': Timestamp.fromDate(DateTime.now()),
     });
@@ -1170,188 +1282,25 @@ class _DisputeCard extends StatelessWidget {
 }
 ```
 
-# STEP 10 — `AdminDashboardViewModel` (5 h) — ⚠ most logic in your role
-
-`view_model/admin_dashboard_vm.dart`. Pure aggregation over two streams. Every
-getter below is a plain function of already-loaded lists, which means **you can
-unit-test all of them with no Firestore at all** — construct `FoodOrder`
-objects directly. This is your best source of testing marks; step 13 depends on
-writing this cleanly.
-
-- [ ] `enum DateRange { today, week, month }` declared at the top of the file.
-- [ ] Constructor opens **two** subscriptions — all orders (via
-      `FirestoreService.collectionStream(ordersCollection)` directly, since
-      there's no admin order repository) and `watchAllStalls()`. Two separate
-      `StreamSubscription` fields, both cancelled in `dispose()`. `onError` on
-      both.
-- [ ] `setRange(DateRange)` sets `_range` and notifies — every getter below
-      recomputes off it.
-- [ ] `_rangeStart` — `today` → midnight today (`DateTime(now.year, now.month,
-      now.day)`); `week` → `now.subtract(Duration(days: 7))`; `month` →
-      30 days back.
-- [ ] `_rangeOrders` — private: orders after `_rangeStart` **excluding
-      cancelled**. Every KPI builds on this, so getting the exclusion right
-      here fixes it everywhere.
-- [ ] `totalOrders` → `_rangeOrders.length`
-- [ ] `revenue` → fold of `o.total` in cents (gross order value).
-- [ ] `activeStalls` → stalls with status `open`; `pendingStalls` → status
-      `pending` (drives the badge on your vendor-management tab).
-- [ ] `avgPrepMinutes` → mean of `readyAt.difference(createdAt).inMinutes` over
-      orders that actually reached ready. **Guard the empty case** — return 0,
-      don't divide by zero.
-- [ ] `ordersByHour` → `List<int>` of length 24; bucket each order by
-      `createdAt.hour`. Feeds the peak-hours chart.
-- [ ] `topStalls` → `List<(String, int)>` (a Dart record) of stall name and
-      order count, sorted descending, **capped at 5** via `.take(5)`.
-- [ ] `dispose()` cancels both.
-
-**`lib/features/admin/view_model/admin_dashboard_vm.dart`**
-
-```dart
-import 'dart:async';
-
-import 'package:flutter/foundation.dart';
-
-import '../../../core/services/firestore_service.dart';
-import '../../../core/utils/constants.dart';
-import '../../../models/order.dart';
-import '../../../models/stall.dart';
-import '../repository/admin_stall_repository.dart';
-
-enum DateRange { today, week, month }
-
-/// Aggregates orders and stalls into the admin KPI tiles, peak-hours chart,
-/// and top-stalls list, filtered by [DateRange].
-class AdminDashboardViewModel extends ChangeNotifier {
-  final FirestoreService _firestore;
-  final AdminStallRepository _stallRepository;
-
-  StreamSubscription<List<Map<String, dynamic>>>? _ordersSub;
-  StreamSubscription<List<Stall>>? _stallsSub;
-
-  List<FoodOrder> _orders = [];
-  List<Stall> _stalls = [];
-  bool _loading = true;
-  DateRange _range = DateRange.today;
-
-  AdminDashboardViewModel({
-    FirestoreService? firestore,
-    AdminStallRepository? stallRepository,
-  })  : _firestore = firestore ?? FirestoreService(),
-        _stallRepository = stallRepository ?? AdminStallRepository() {
-    _ordersSub = _firestore
-        .collectionStream(AppConstants.ordersCollection)
-        .listen(
-      (rows) {
-        _orders = rows.map(FoodOrder.fromJson).toList();
-        _loading = false;
-        notifyListeners();
-      },
-      onError: (Object e) {
-        debugPrint('AdminDashboardViewModel orders stream error: $e');
-        _loading = false;
-        notifyListeners();
-      },
-    );
-    _stallsSub = _stallRepository.watchAllStalls().listen(
-      (stalls) {
-        _stalls = stalls;
-        notifyListeners();
-      },
-      onError: (Object e) {
-        debugPrint('AdminDashboardViewModel stalls stream error: $e');
-      },
-    );
-  }
-
-  bool get isLoading => _loading;
-  DateRange get range => _range;
-
-  void setRange(DateRange range) {
-    _range = range;
-    notifyListeners();
-  }
-
-  DateTime get _rangeStart {
-    final now = DateTime.now();
-    switch (_range) {
-      case DateRange.today:
-        return DateTime(now.year, now.month, now.day);
-      case DateRange.week:
-        return now.subtract(const Duration(days: 7));
-      case DateRange.month:
-        return now.subtract(const Duration(days: 30));
-    }
-  }
-
-  /// Orders within the selected range, excluding cancelled ones.
-  List<FoodOrder> get _rangeOrders {
-    final start = _rangeStart;
-    return _orders
-        .where((o) =>
-            o.createdAt.isAfter(start) &&
-            o.status != AppConstants.orderCancelled)
-        .toList();
-  }
-
-  int get totalOrders => _rangeOrders.length;
-
-  /// Gross value of orders in range, in cents.
-  int get revenue => _rangeOrders.fold(0, (acc, o) => acc + o.total);
-
-  int get activeStalls =>
-      _stalls.where((s) => s.status == AppConstants.stallOpen).length;
-
-  int get pendingStalls =>
-      _stalls.where((s) => s.status == AppConstants.stallPending).length;
-
-  /// Mean minutes from order creation to ready, over orders that reached ready.
-  double get avgPrepMinutes {
-    final withReady =
-        _rangeOrders.where((o) => o.readyAt != null).toList();
-    if (withReady.isEmpty) return 0;
-    final total = withReady.fold<int>(
-      0,
-      (acc, o) => acc + o.readyAt!.difference(o.createdAt).inMinutes,
-    );
-    return total / withReady.length;
-  }
-
-  /// Order counts bucketed by hour of day (index 0–23).
-  List<int> get ordersByHour {
-    final buckets = List<int>.filled(24, 0);
-    for (final order in _rangeOrders) {
-      buckets[order.createdAt.hour]++;
-    }
-    return buckets;
-  }
-
-  /// Top stalls by order count, as (stallName, orderCount), max 5.
-  List<(String, int)> get topStalls {
-    final counts = <String, int>{};
-    for (final order in _rangeOrders) {
-      counts[order.stallName] = (counts[order.stallName] ?? 0) + 1;
-    }
-    final entries = counts.entries.toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
-    return entries.take(5).map((e) => (e.key, e.value)).toList();
-  }
-
-  @override
-  void dispose() {
-    _ordersSub?.cancel();
-    _stallsSub?.cancel();
-    super.dispose();
-  }
-}
-```
-
-# STEP 11 — ⚠ `admin_dashboard_page.dart` (12 h) — hardest file you own
+# STEP 10 — ⚠ `admin_dashboard_page.dart` (12 h) — hardest file you own
 
 324 lines. The difficulty is `fl_chart`, which has a fiddly API — budget real
 time for it and build the page in three passes.
 
-**11a — shell and KPI tiles (4 h)**
+> **Stub first (30 min — worth more here than anywhere else).** Write
+> `AdminDashboardViewModel` with `enum DateRange { today, week, month }`, a
+> `setRange(...)` that just swaps which hardcoded set you return, and every
+> getter step 11 will eventually compute for real: `isLoading`, `totalOrders`,
+> `revenue`, `activeStalls`, `pendingApprovals`, `avgPrepMinutes`,
+> `ordersByHour` (a `Map<int,int>` — hardcode a plausible lunch spike so the
+> chart has a recognisable shape), and `topStalls`.
+>
+> Make the three ranges return **visibly different** numbers. That is what lets
+> you verify the range selector wiring here, twelve hours before the real
+> aggregation exists — and `fl_chart` is far easier to fight with data you
+> control than with whatever the seed script happened to produce.
+
+**10a — shell and KPI tiles (4 h)**
 - [ ] `ChangeNotifierProvider` creating the VM; loading state first.
 - [ ] A `SegmentedButton` or `ChoiceChip` row for Today / Week / Month calling
       `vm.setRange(...)`. Every tile below must visibly change when you switch
@@ -1360,7 +1309,7 @@ time for it and build the page in three passes.
       active stalls, pending approvals, `vm.avgPrepMinutes.toStringAsFixed(1)`
       minutes.
 
-**11b — peak hours chart (5 h)**
+**10b — peak hours chart (5 h)**
 - [ ] `fl_chart` `BarChart` over `vm.ordersByHour`. 24 bars is too many to
       label — label every third hour and format as `09:00`.
 - [ ] Get a static chart rendering with dummy data **first**, then wire the real
@@ -1368,7 +1317,7 @@ time for it and build the page in three passes.
       where the hours disappear.
 - [ ] Handle the all-zeros case so an empty venue doesn't render a broken axis.
 
-**11c — top stalls (3 h)**
+**10c — top stalls (3 h)**
 - [ ] A ranked list from `vm.topStalls` — position, stall name, order count,
       and a proportional bar (a `LinearProgressIndicator` against the top
       stall's count is enough; no chart library needed).
@@ -1382,7 +1331,8 @@ arrive at the same time and you won't know which is which.
 Note `AdminKpiGrid` is **public** while every other section widget is private.
 That is deliberate: the full page also reads `AuthViewModel` (and therefore
 needs a live FirebaseAuth), which a widget test cannot construct, so the KPI
-row is pulled out where step 13 can test it in isolation.
+row is pulled out where step 13 can test it in isolation (and where step 11's
+real getter can feed it unchanged).
 
 **`lib/features/admin/view/admin_dashboard_page.dart`**
 
@@ -1716,6 +1666,187 @@ class _TopStalls extends StatelessWidget {
 }
 ```
 
+# STEP 11 — `AdminDashboardViewModel` (5 h) — ⚠ most logic in your role
+
+`view_model/admin_dashboard_vm.dart`. Pure aggregation over two streams. Every
+getter below is a plain function of already-loaded lists, which means **you can
+unit-test all of them with no Firestore at all** — construct `FoodOrder`
+objects directly. This is your best source of testing marks; step 13 depends on
+writing this cleanly.
+
+> **This replaces your step 10 stub.** You already know every getter's exact
+> name and return type, because the chart code in `admin_dashboard_page.dart`
+> is already consuming them. All you are doing here is computing the real value
+> instead of returning a hardcoded one — which is a much more contained problem
+> than designing the API and the aggregation at the same time. The page should
+> need zero edits. Delete the stub in this commit.
+
+- [ ] `enum DateRange { today, week, month }` declared at the top of the file.
+- [ ] Constructor opens **two** subscriptions — all orders (straight off
+      `firestore.collection(ordersCollection).snapshots()`, since there's no
+      admin order repository) and `watchAllStalls()`. Two separate
+      `StreamSubscription` fields, both cancelled in `dispose()`. `onError` on
+      both.
+- [ ] `setRange(DateRange)` sets `_range` and notifies — every getter below
+      recomputes off it.
+- [ ] `_rangeStart` — `today` → midnight today (`DateTime(now.year, now.month,
+      now.day)`); `week` → `now.subtract(Duration(days: 7))`; `month` →
+      30 days back.
+- [ ] `_rangeOrders` — private: orders after `_rangeStart` **excluding
+      cancelled**. Every KPI builds on this, so getting the exclusion right
+      here fixes it everywhere.
+- [ ] `totalOrders` → `_rangeOrders.length`
+- [ ] `revenue` → fold of `o.total` in cents (gross order value).
+- [ ] `activeStalls` → stalls with status `open`; `pendingStalls` → status
+      `pending` (drives the badge on your vendor-management tab).
+- [ ] `avgPrepMinutes` → mean of `readyAt.difference(createdAt).inMinutes` over
+      orders that actually reached ready. **Guard the empty case** — return 0,
+      don't divide by zero.
+- [ ] `ordersByHour` → `List<int>` of length 24; bucket each order by
+      `createdAt.hour`. Feeds the peak-hours chart.
+- [ ] `topStalls` → `List<(String, int)>` (a Dart record) of stall name and
+      order count, sorted descending, **capped at 5** via `.take(5)`.
+- [ ] `dispose()` cancels both.
+
+**`lib/features/admin/view_model/admin_dashboard_vm.dart`**
+
+```dart
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
+
+import '../../../core/utils/constants.dart';
+import '../../../models/order.dart';
+import '../../../models/stall.dart';
+import '../repository/admin_stall_repository.dart';
+
+enum DateRange { today, week, month }
+
+/// Aggregates orders and stalls into the admin KPI tiles, peak-hours chart,
+/// and top-stalls list, filtered by [DateRange].
+class AdminDashboardViewModel extends ChangeNotifier {
+  final AdminStallRepository _stallRepository;
+
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _ordersSub;
+  StreamSubscription<List<Stall>>? _stallsSub;
+
+  List<FoodOrder> _orders = [];
+  List<Stall> _stalls = [];
+  bool _loading = true;
+  DateRange _range = DateRange.today;
+
+  AdminDashboardViewModel({
+    FirebaseFirestore? db,
+    AdminStallRepository? stallRepository,
+  }) : _stallRepository = stallRepository ?? AdminStallRepository(db: db) {
+    final firestore = db ?? FirebaseFirestore.instance;
+    _ordersSub =
+        firestore.collection(AppConstants.ordersCollection).snapshots().listen(
+      (snap) {
+        _orders = snap.docs.map((d) => FoodOrder.fromJson(d.data())).toList();
+        _loading = false;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('AdminDashboardViewModel orders stream error: $e');
+        _loading = false;
+        notifyListeners();
+      },
+    );
+    _stallsSub = _stallRepository.watchAllStalls().listen(
+      (stalls) {
+        _stalls = stalls;
+        notifyListeners();
+      },
+      onError: (Object e) {
+        debugPrint('AdminDashboardViewModel stalls stream error: $e');
+      },
+    );
+  }
+
+  bool get isLoading => _loading;
+  DateRange get range => _range;
+
+  void setRange(DateRange range) {
+    _range = range;
+    notifyListeners();
+  }
+
+  DateTime get _rangeStart {
+    final now = DateTime.now();
+    switch (_range) {
+      case DateRange.today:
+        return DateTime(now.year, now.month, now.day);
+      case DateRange.week:
+        return now.subtract(const Duration(days: 7));
+      case DateRange.month:
+        return now.subtract(const Duration(days: 30));
+    }
+  }
+
+  /// Orders within the selected range, excluding cancelled ones.
+  List<FoodOrder> get _rangeOrders {
+    final start = _rangeStart;
+    return _orders
+        .where((o) =>
+            o.createdAt.isAfter(start) &&
+            o.status != AppConstants.orderCancelled)
+        .toList();
+  }
+
+  int get totalOrders => _rangeOrders.length;
+
+  /// Gross value of orders in range, in cents.
+  int get revenue => _rangeOrders.fold(0, (acc, o) => acc + o.total);
+
+  int get activeStalls =>
+      _stalls.where((s) => s.status == AppConstants.stallOpen).length;
+
+  int get pendingStalls =>
+      _stalls.where((s) => s.status == AppConstants.stallPending).length;
+
+  /// Mean minutes from order creation to ready, over orders that reached ready.
+  double get avgPrepMinutes {
+    final withReady =
+        _rangeOrders.where((o) => o.readyAt != null).toList();
+    if (withReady.isEmpty) return 0;
+    final total = withReady.fold<int>(
+      0,
+      (acc, o) => acc + o.readyAt!.difference(o.createdAt).inMinutes,
+    );
+    return total / withReady.length;
+  }
+
+  /// Order counts bucketed by hour of day (index 0–23).
+  List<int> get ordersByHour {
+    final buckets = List<int>.filled(24, 0);
+    for (final order in _rangeOrders) {
+      buckets[order.createdAt.hour]++;
+    }
+    return buckets;
+  }
+
+  /// Top stalls by order count, as (stallName, orderCount), max 5.
+  List<(String, int)> get topStalls {
+    final counts = <String, int>{};
+    for (final order in _rangeOrders) {
+      counts[order.stallName] = (counts[order.stallName] ?? 0) + 1;
+    }
+    final entries = counts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return entries.take(5).map((e) => (e.key, e.value)).toList();
+  }
+
+  @override
+  void dispose() {
+    _ordersSub?.cancel();
+    _stallsSub?.cancel();
+    super.dispose();
+  }
+}
+```
+
 # STEP 12 — `VenueConfigRepository` + `admin_settings_page.dart` (5 h)
 
 ⚠ **Read `foundation_and_integration.md` §6.1 before starting this step.** The
@@ -1726,12 +1857,12 @@ version, and the wiring itself is step 14 (paired with Mervin).
 - [ ] **Create the repository at `lib/core/repository/venue_config_repository.dart`**,
       not under `features/admin/`. All three roles read the venue config now, so
       it belongs in core. You still own the writes.
-- [ ] `watchConfig()` → `Stream<VenueConfig?>` from
-      `documentStream('config/venue')`.
-- [ ] `updateCommission(double rate)` — `setDocument` with **`merge: true`**.
-      Merge is essential: the same document holds the pickup-code counter that
-      Mervin's `placeOrder` bumps on every order, and a non-merged write would
-      wipe it.
+- [ ] `watchConfig()` → `Stream<VenueConfig?>` off the `config/venue`
+      document's `.snapshots()`.
+- [ ] `updateCommission(double rate)` — `.set(...)` with
+      **`SetOptions(merge: true)`**. Merge is essential: the same document
+      holds the pickup-code counter that Mervin's `placeOrder` bumps on every
+      order, and a non-merged write would wipe it.
 - [ ] `updateServiceFee(int cents)` — same pattern. *(New — the reference has
       no way to edit the service fee at all.)*
 - [ ] `totalTopUps()` → sum of `amount` over transactions where
@@ -1753,7 +1884,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 // NOTE: this file lives at lib/core/repository/venue_config_repository.dart,
 // not under features/admin/. All three roles read the venue config now, so it
 // is core code. The admin still owns the *writes*.
-import '../services/firestore_service.dart';
 import '../utils/constants.dart';
 import '../../models/transaction.dart';
 import '../../models/venue_config.dart';
@@ -1761,64 +1891,60 @@ import '../../models/venue_config.dart';
 /// Reads/writes the singleton `config/venue` document and provides wallet
 /// monitoring totals for the admin settings screen.
 class VenueConfigRepository {
-  final FirestoreService _firestore;
+  final FirebaseFirestore _db;
 
-  VenueConfigRepository({FirestoreService? firestore})
-      : _firestore = firestore ?? FirestoreService();
+  VenueConfigRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String get _path =>
-      '${AppConstants.configCollection}/${AppConstants.venueConfigDoc}';
+  DocumentReference<Map<String, dynamic>> get _doc => _db
+      .collection(AppConstants.configCollection)
+      .doc(AppConstants.venueConfigDoc);
 
   Stream<VenueConfig?> watchConfig() {
-    return _firestore
-        .documentStream(_path)
-        .map((data) => data == null ? null : VenueConfig.fromJson(data));
+    return _doc.snapshots().map(
+          (snap) =>
+              snap.data() == null ? null : VenueConfig.fromJson(snap.data()!),
+        );
   }
 
   /// One-shot read, for callers that need the config once rather than as a
   /// stream (e.g. seeding the cart's service fee at checkout).
   Future<VenueConfig?> getConfig() async {
-    final data = await _firestore.getDocument(_path);
+    final snap = await _doc.get();
+    final data = snap.data();
     return data == null ? null : VenueConfig.fromJson(data);
   }
 
   /// [rate] is a FRACTION (0.15 = 15%), not a percentage. The settings page
   /// divides the typed percentage by 100 before calling this.
   ///
-  /// `merge: true` is essential: this same document holds the pickup-code
-  /// counter that `OrderRepository.placeOrder` bumps on every order. A
-  /// non-merged write would wipe it and restart every pickup code at A001.
+  /// `SetOptions(merge: true)` is essential: this same document holds the
+  /// pickup-code counter that `OrderRepository.placeOrder` bumps on every
+  /// order. A non-merged write would wipe it and restart every pickup code
+  /// at A001.
   Future<void> updateCommission(double rate) {
-    return _firestore.setDocument(
-      _path,
-      {
-        'defaultCommission': rate,
-        'updatedAt': Timestamp.fromDate(DateTime.now()),
-      },
-      merge: true,
-    );
+    return _doc.set({
+      'defaultCommission': rate,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    }, SetOptions(merge: true));
   }
 
   /// Flat per-order service fee in CENTS. Same merge rule as above.
   Future<void> updateServiceFee(int cents) {
-    return _firestore.setDocument(
-      _path,
-      {
-        'serviceFee': cents,
-        'updatedAt': Timestamp.fromDate(DateTime.now()),
-      },
-      merge: true,
-    );
+    return _doc.set({
+      'serviceFee': cents,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    }, SetOptions(merge: true));
   }
 
   /// Total amount ever topped up across all users, in cents.
   Future<int> totalTopUps() async {
-    final rows = await _firestore.getCollection(
-      AppConstants.transactionsCollection,
-      query: (q) => q.where('type', isEqualTo: AppConstants.txnTopUp),
-    );
-    return rows
-        .map(WalletTransaction.fromJson)
+    final snap = await _db
+        .collection(AppConstants.transactionsCollection)
+        .where('type', isEqualTo: AppConstants.txnTopUp)
+        .get();
+    return snap.docs
+        .map((d) => WalletTransaction.fromJson(d.data()))
         .fold<int>(0, (acc, t) => acc + t.amount);
   }
 }
@@ -2139,7 +2265,7 @@ FoodOrder order({
 
 **`test/admin/admin_dashboard_vm_test.dart`** — the view model opens two
 Firestore streams in its constructor, so pass a `FakeFirebaseFirestore`
-through `FirestoreService(db: db)` and seed the docs *before* constructing it:
+straight in as `db` and seed the docs *before* constructing it:
 
 ```dart
 late FakeFirebaseFirestore db;
@@ -2149,7 +2275,7 @@ Future<AdminDashboardViewModel> vmWith(List<FoodOrder> orders) async {
     await db.collection('orders').doc(o.orderId).set(o.toJson());
   }
   final vm = AdminDashboardViewModel(
-    firestore: FirestoreService(db: db),
+    db: db,
     stallRepository: AdminStallRepository(db: db),
   );
   addTearDown(vm.dispose);
@@ -2542,28 +2668,32 @@ is safer than recomputing it at refund time.
 
 ## Effort summary
 
-| Step | File | Hours |
-|---|---|---|
-| 1 | `admin_stall_repository.dart` | 2 |
-| 2 | `vendor_management_vm.dart` | 2 |
-| 3 | `vendor_management_page.dart` | 6 |
-| 4 | `announcement_repository.dart` | 2 |
-| 5 | `announcements_vm.dart` | 1.5 |
-| 6 | `announcements_page.dart` | 5 |
-| 7 | ⚠ `dispute_repository.dart` (transaction) | 4 |
-| 8 | `disputes_vm.dart` | 1.5 |
-| 9 | `disputes_page.dart` | 6 |
-| 10 | ⚠ `admin_dashboard_vm.dart` | 5 |
-| 11 | ⚠ `admin_dashboard_page.dart` (charts) | **12** |
-| 12 | venue config + settings page | 5 |
-| 13 | tests | 5 |
-| 15 | report assets | 4 |
-| | **Subtotal** | **~50 h** |
-| 14 | commission fix (paired w/ Mervin) | +5 |
+| Step | Slice | File | Hours |
+|---|---|---|---|
+| 1 | Vendors | `vendor_management_page.dart` (on a stub VM) | 6 |
+| 2 | Vendors | `admin_stall_repository.dart` | 2 |
+| 3 | Vendors | `vendor_management_vm.dart` (replaces stub) | 2 |
+| 4 | Announce | `announcements_page.dart` (on a stub VM) | 5 |
+| 5 | Announce | `announcement_repository.dart` | 2 |
+| 6 | Announce | `announcements_vm.dart` (replaces stub) | 1.5 |
+| 7 | Disputes | ⚠ `dispute_repository.dart` (transaction) — **logic first** | 4 |
+| 8 | Disputes | `disputes_vm.dart` | 1.5 |
+| 9 | Disputes | `disputes_page.dart` | 6 |
+| 10 | Dashboard | ⚠ `admin_dashboard_page.dart` (charts, on a stub VM) | **12** |
+| 11 | Dashboard | ⚠ `admin_dashboard_vm.dart` (replaces stub) | 5 |
+| 12 | Config | venue config + settings page | 5 |
+| 13 | — | tests | 5 |
+| 15 | — | report assets | 4 |
+| | | **Subtotal** | **~50 h** |
+| 14 | — | commission fix (paired w/ Mervin) | +5 |
+
+Note slices 1, 2 and 4 run **UI → repository → real ViewModel**; the disputes
+slice (7–9) is the one that runs the other way round, because it moves money.
 
 **Hardest file: `admin_dashboard_page.dart` (12 h)** — not because the logic is
-hard (step 10 already did the thinking) but because `fl_chart` has a fiddly
-API. Build the chart with dummy data first, then wire the real getter.
+hard (step 11 does that thinking, after this) but because `fl_chart` has a
+fiddly API. You build the chart against your stub VM's fake series, which is
+exactly why the stub is worth the fifteen minutes.
 
 **Second hardest: `dispute_repository.dart` (4 h)** — it is short, but it is
 the only Firestore transaction you write, and it moves real money. The

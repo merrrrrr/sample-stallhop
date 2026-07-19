@@ -4,8 +4,20 @@
 transaction logic + final integration
 **Total estimate:** ~25 h (Phase 0) + ~45 h (Phase 1) + ~12 h (Phase 2/3)
 
-Read `foundation_and_integration.md` first. Phase 0 blocks both teammates —
-their Phase 1 cannot start until it is merged, so protect that timeline.
+Read `foundation_and_integration.md` first.
+
+**You unblock your teammates at §0.4, not at §0.8.** Justin and Yong Jun build
+their screens UI-first against stub ViewModels, so what they actually need from
+you is the vocabulary their widgets are written in — constants, theme,
+formatters, validators, models and the shared widgets. That is §0.1–§0.4,
+about 16 h. Auth, security rules and seed data (§0.5–§0.7, the remaining ~9 h)
+can land while they are already building.
+
+So **merge §0.1–§0.4 as its own commit and tell them the moment it lands.**
+Do not hold all of Phase 0 back as one 25 h branch — that idles two people for
+an extra week for no reason. Protect that early merge above everything else in
+your own schedule; it is the single highest-leverage thing you do on this
+project.
 
 ---
 
@@ -253,6 +265,15 @@ mechanism, which is exactly why Yong Jun's `Info.plist` fix exists:
 ## 0.2 Core layer, in dependency order (~6 h)
 
 Build in exactly this order — each depends only on what precedes it.
+
+**Teammate-blocking vs. not.** `constants.dart`, `formatters.dart`,
+`validators.dart` and the theme files are imported by nearly every widget
+Justin and Yong Jun write, so they are on the critical path — get them right
+and get them merged. `auth_service.dart`,
+`notification_service.dart` and `app_router.dart` are **not** needed for their
+UI steps (their stub ViewModels touch no Firestore at all); those only matter
+once they reach their repository steps, roughly two weeks later. If you fall
+behind, that is where the slack is.
 
 - [ ] **`lib/core/utils/constants.dart`**
       A private-constructor holder (`AppConstants._();`) of `static const`
@@ -717,87 +738,53 @@ class AppTheme {
 }
 ```
 
-- [ ] **`lib/core/services/firestore_service.dart`** ← *the keystone file*
-      Declares `typedef JsonMap = Map<String, dynamic>;` and
-      `typedef QueryBuilder = Query<JsonMap> Function(Query<JsonMap>);`.
-      Wraps an injectable `FirebaseFirestore _db`. Methods: `newDocId(path)`
-      (id without a write), `getDocument`, `documentStream`, `setDocument(path,
-      data, {merge})`, `updateDocument`, `deleteDocument`, `getCollection(path,
-      {QueryBuilder? query})`, `collectionStream(path, {QueryBuilder? query})`.
-      Collection methods apply the optional `query` callback to shape the
-      `Query` before executing, then map `snap.docs` to raw `.data()` maps.
-      **Returns maps, never snapshots** — every StallHop document embeds its
-      own id, so callers never need `doc.id`. Be ready to explain that trade-off.
+### Data access: repositories talk to Firestore directly
 
-**`lib/core/services/firestore_service.dart`**
+There is **no generic `FirestoreService` wrapper** in StallHop. Every
+repository holds an injectable `FirebaseFirestore` and uses the SDK directly:
 
 ```dart
-import 'package:cloud_firestore/cloud_firestore.dart';
-
-typedef JsonMap = Map<String, dynamic>;
-typedef QueryBuilder = Query<JsonMap> Function(Query<JsonMap> query);
-
-/// Generic Firestore helper. Every document in StallHop embeds its own id
-/// field (uid, stallId, orderId, …), so returning raw data maps is enough to
-/// reconstruct models — callers don't need the [DocumentSnapshot] id.
-class FirestoreService {
+class SomeRepository {
   final FirebaseFirestore _db;
 
-  FirestoreService({FirebaseFirestore? db})
+  SomeRepository({FirebaseFirestore? db})
       : _db = db ?? FirebaseFirestore.instance;
 
-  /// Generates an id for a new document in [collectionPath] without writing.
-  String newDocId(String collectionPath) =>
-      _db.collection(collectionPath).doc().id;
+  CollectionReference<Map<String, dynamic>> get _stalls =>
+      _db.collection(AppConstants.stallsCollection);
 
-  Future<JsonMap?> getDocument(String path) async {
-    final snap = await _db.doc(path).get();
-    return snap.data();
-  }
-
-  Stream<JsonMap?> documentStream(String path) {
-    return _db.doc(path).snapshots().map((snap) => snap.data());
-  }
-
-  Future<void> setDocument(String path, JsonMap data, {bool merge = false}) {
-    return _db.doc(path).set(data, SetOptions(merge: merge));
-  }
-
-  Future<void> updateDocument(String path, JsonMap data) {
-    return _db.doc(path).update(data);
-  }
-
-  Future<void> deleteDocument(String path) {
-    return _db.doc(path).delete();
-  }
-
-  Future<List<JsonMap>> getCollection(
-    String path, {
-    QueryBuilder? query,
-  }) async {
-    Query<JsonMap> ref = _db.collection(path);
-    if (query != null) ref = query(ref);
-    final snap = await ref.get();
-    return snap.docs.map((d) => d.data()).toList();
-  }
-
-  Stream<List<JsonMap>> collectionStream(
-    String path, {
-    QueryBuilder? query,
-  }) {
-    Query<JsonMap> ref = _db.collection(path);
-    if (query != null) ref = query(ref);
-    return ref.snapshots().map(
-          (snap) => snap.docs.map((d) => d.data()).toList(),
+  Stream<List<Stall>> watchStalls() {
+    return _stalls.snapshots().map(
+          (snap) => snap.docs.map((d) => Stall.fromJson(d.data())).toList(),
         );
   }
 }
 ```
 
-> The injectable `FirebaseFirestore? db` on the constructor is not decoration —
-> it is what lets every repository in the app be tested against
-> `FakeFirebaseFirestore`. Every repository your teammates write copies this
-> same constructor shape for exactly that reason.
+**Every repository in all three plans copies this exact constructor shape.**
+That `FirebaseFirestore? db` parameter is not decoration — it is the seam that
+lets each repository be tested against `FakeFirebaseFirestore` without touching
+a real network.
+
+> **Why no wrapper?** An earlier draft of this plan had a generic
+> `FirestoreService` with `getDocument` / `collectionStream` / `setDocument`
+> helpers. It was removed. The moment a repository needs a transaction, a
+> batch, or `arrayUnion` — and StallHop's wallet, order, and review paths all
+> do — the wrapper has nothing to offer and the code drops to the raw SDK
+> anyway. Repositories ended up holding *both* the wrapper and a raw
+> `FirebaseFirestore`, reaching past the wrapper more often than through it.
+> Two dependencies and two idioms to save typing `.data()` is a bad trade. It
+> bought no testability either: the tests inject `FakeFirebaseFirestore`
+> directly, which works just as well without the layer.
+>
+> If an examiner asks why there is no service layer between repositories and
+> Firestore: the repository *is* that layer. It is what turns raw maps into
+> typed models and keeps query logic out of the UI. Adding a second, thinner
+> layer underneath only pushes typing around.
+
+Since every document in StallHop embeds its own id field (`uid`, `stallId`,
+`orderId`, …), `d.data()` is always enough to rebuild a model — no repository
+needs `doc.id` when reading.
 
 - [ ] **`lib/core/services/auth_service.dart`**
       Injectable `FirebaseAuth` + `GoogleSignIn`. Exposes `currentUser`,
@@ -2701,48 +2688,79 @@ Cases: `preparing` → 1, `ready` → 2, `collected` → 3, and `cancelled` show
 `'Order cancelled'` with `find.byType(CircleAvatar)` finding **nothing** —
 the cancelled state replaces the stepper rather than greying it out.
 
+---
+
+## ⚑ 0.4a — Unblock your teammates (~16 h in)
+
+**This is a milestone, not a task. Everything above ships now.**
+
+- [ ] `flutter analyze` clean on §0.1–§0.4.
+- [ ] Merge to `main` — do not wait for auth, rules or seed data.
+- [ ] **Run the 90-minute teaching session** (`foundation_and_integration.md`
+      §5). It has to happen here rather than at §0.8, because it is what lets
+      Justin and Yong Jun start.
+- [ ] Tell them explicitly what they now have: `AppConstants`, the theme,
+      `centsToRM` / `formatDate` / `timeAgo`, `Validators`, every model in
+      `lib/models/`, `EmptyState` and `LoadingIndicator`. That list is exactly
+      the surface their stub ViewModels and first screens are written against.
+- [ ] Walk them through the stub-ViewModel pattern in their plans' "How you
+      build each slice" section — one worked example on the menu VM is enough,
+      and it is the same example the teaching session already uses.
+
+From here they are building in parallel with you. §0.5–§0.7 below block
+**your** Phase 1, not theirs.
+
+---
+
 ## 0.5 Auth feature (~4 h)
 
 - [ ] **`features/auth/repository/auth_repository.dart`**
-      Thin user-document CRUD over `FirestoreService`: `createUser(AppUser)`,
+      Thin user-document CRUD at `users/{uid}`: `createUser(AppUser)`,
       `getUser(uid)`, `watchUser(uid) → Stream<AppUser?>`, `updateUser(uid, map)`.
 
 **`lib/features/auth/repository/auth_repository.dart`**
 
 ```dart
-import '../../../core/services/firestore_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 import '../../../core/utils/constants.dart';
 import '../../../models/user.dart';
 
-/// User-document CRUD on top of [FirestoreService].
+/// User-document CRUD at `users/{uid}`.
 class AuthRepository {
-  final FirestoreService _firestore;
+  final FirebaseFirestore _db;
 
-  AuthRepository({FirestoreService? firestore})
-      : _firestore = firestore ?? FirestoreService();
+  AuthRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String get _col => AppConstants.usersCollection;
+  DocumentReference<Map<String, dynamic>> _userRef(String uid) =>
+      _db.collection(AppConstants.usersCollection).doc(uid);
 
   Future<void> createUser(AppUser user) {
-    return _firestore.setDocument('$_col/${user.uid}', user.toJson());
+    return _userRef(user.uid).set(user.toJson());
   }
 
   Future<AppUser?> getUser(String uid) async {
-    final data = await _firestore.getDocument('$_col/$uid');
+    final snap = await _userRef(uid).get();
+    final data = snap.data();
     return data == null ? null : AppUser.fromJson(data);
   }
 
   Stream<AppUser?> watchUser(String uid) {
-    return _firestore
-        .documentStream('$_col/$uid')
-        .map((data) => data == null ? null : AppUser.fromJson(data));
+    return _userRef(uid).snapshots().map(
+          (snap) => snap.data() == null ? null : AppUser.fromJson(snap.data()!),
+        );
   }
 
   Future<void> updateUser(String uid, Map<String, dynamic> data) {
-    return _firestore.updateDocument('$_col/$uid', data);
+    return _userRef(uid).update(data);
   }
 }
 ```
+
+> Note the `_userRef(uid)` helper. Building the `DocumentReference` once and
+> reusing it across all four methods is the pattern every StallHop repository
+> follows — it keeps `AppConstants.usersCollection` in exactly one place.
 
 - [ ] **`features/auth/view_model/auth_view_model.dart`** ← *the most
       structurally important file in the app*
@@ -4689,17 +4707,38 @@ flutter test integration_test/seed_test.dart
 - [ ] `flutter test` green
 - [ ] App boots → login → register → each role lands on its (possibly stubbed)
       home
-- [ ] Merge `phase0-foundation` → `main`
-- [ ] **Run the 90-minute teaching session** (`foundation_and_integration.md`
-      §5) before either teammate starts. Do not skip this to save time — it is
-      what makes their Q&A survivable.
+- [ ] Merge the remainder of `phase0-foundation` → `main`
+- [ ] The teaching session already happened at §0.4a. If it somehow did not,
+      stop and run it now — it is what makes their Q&A survivable, and by this
+      point they have been building for a week without it.
+- [ ] Check in on both teammates' first screens. A week of UI built against a
+      stub is also a week in which a wrong assumption about a model field can
+      go unnoticed — a ten-minute look at their pages now is cheap.
 
 ---
 
 # PHASE 1 — Customer role (~45 h)
 
-Build order per screen: **repository → view model → view.** Never write a view
-before its view model compiles.
+**Your build order deliberately differs from your teammates', and you should be
+able to say why.** Justin and Yong Jun build UI-first against stub ViewModels,
+because their risk is UI volume — two 12 h screens each — over simple logic.
+Your risk is the opposite. `placeOrder` (§1.5) is the highest-risk file in the
+app, `CartViewModel` (§1.4) is pure computation, and the wallet (§1.6) moves
+money. **Where logic is the hard part, logic goes first**; where layout is the
+hard part, layout goes first. Same principle, opposite conclusion.
+
+So: **repository → view model → view**, except in §1.2 and §1.3, where the
+browse and menu screens are ordinary list UI and you get the same benefit your
+teammates do from stubbing the ViewModel first (see their plans' "How you build
+each slice"). §1.4–§1.8 stay strictly logic-first.
+
+Never write a view before its view model compiles.
+
+**Non-negotiable:** §1.5 and §1.6 are written **and unit-tested against
+`fake_cloud_firestore` before any checkout UI exists**. A wrong total, a
+double-charged wallet or a refund that credits the wrong amount is the one
+class of bug on this project that a late integration crunch cannot recover
+from — and it is the first thing an examiner will probe.
 
 ## 1.1 `StallRepository` (~2 h)
 `features/customer/repository/stall_repository.dart`. Read-only access for
@@ -4717,51 +4756,66 @@ only parts worth writing out are the path helpers and the visibility filter:
 
 ```dart
 class StallRepository {
-  final FirestoreService _firestore;
+  final FirebaseFirestore _db;
 
-  StallRepository({FirestoreService? firestore})
-      : _firestore = firestore ?? FirestoreService();
+  StallRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String get _col => AppConstants.stallsCollection;
+  CollectionReference<Map<String, dynamic>> get _stalls =>
+      _db.collection(AppConstants.stallsCollection);
 
-  String _menuPath(String stallId) =>
-      '$_col/$stallId/${AppConstants.menuItemsSubcollection}';
+  CollectionReference<Map<String, dynamic>> _menu(String stallId) =>
+      _stalls.doc(stallId).collection(AppConstants.menuItemsSubcollection);
 
-  /// Streams stalls visible to customers (open or temporarily closed, but not
+  /// Stalls visible to customers (open or temporarily closed, but not
   /// pending/suspended/rejected).
+  Query<Map<String, dynamic>> get _visibleQuery => _stalls.where(
+        'status',
+        whereIn: [AppConstants.stallOpen, AppConstants.stallClosed],
+      );
+
   Stream<List<Stall>> watchVisibleStalls() {
-    return _firestore
-        .collectionStream(
-          _col,
-          query: (q) => q.where(
-            'status',
-            whereIn: [AppConstants.stallOpen, AppConstants.stallClosed],
-          ),
-        )
-        .map((rows) => rows.map(Stall.fromJson).toList());
+    return _visibleQuery.snapshots().map(
+          (snap) => snap.docs.map((d) => Stall.fromJson(d.data())).toList(),
+        );
   }
 }
 ```
 
 ⚠️ The `whereIn` list is the *entire* mechanism behind Justin's approve and
 suspend buttons — he never deletes anything, he just moves a stall out of
-those two statuses. Repeat the same filter in `getVisibleStalls()` (one-shot,
-`getCollection` instead of `collectionStream`). The remaining four methods:
+those two statuses. Pulling it into the `_visibleQuery` getter means the
+streaming and one-shot reads cannot drift apart: `getVisibleStalls()` is the
+same query with `.get()` instead of `.snapshots()`. The remaining four methods:
 
 ```dart
-Stream<Stall?> watchStall(String stallId) => _firestore
-    .documentStream('$_col/$stallId')
-    .map((data) => data == null ? null : Stall.fromJson(data));
+Stream<Stall?> watchStall(String stallId) =>
+    _stalls.doc(stallId).snapshots().map(
+          (snap) => snap.data() == null ? null : Stall.fromJson(snap.data()!),
+        );
 
-Stream<List<MenuItem>> watchMenuItems(String stallId) => _firestore
-    .collectionStream(_menuPath(stallId))
-    .map((rows) => rows.map(MenuItem.fromJson).toList());
+Stream<List<MenuItem>> watchMenuItems(String stallId) =>
+    _menu(stallId).snapshots().map(
+          (snap) => snap.docs.map((d) => MenuItem.fromJson(d.data())).toList(),
+        );
 ```
 
-`getStall` and `getMenuItems` are the `getDocument` / `getCollection`
-equivalents of those two.
+`getStall` and `getMenuItems` are the same two with `.get()` in place of
+`.snapshots()`, reading `snap.data()` / `snap.docs` the same way.
 
 ## 1.2 `StallBrowsingViewModel` + home/browse screens (~6 h)
+
+> **Stub-first applies here.** The filtering, sorting and chip-derivation logic
+> below is worth getting right on its own, but the two screens are ordinary list
+> UI. Write the VM with the real getters over a hardcoded `List<Stall>` first,
+> build both screens against it, then swap in the `StallRepository` subscription
+> from §1.1. You also get to demonstrate the pattern working before you ask your
+> teammates to adopt it in the teaching session.
+>
+> Do keep the real filter/sort logic in the stub rather than returning a fixed
+> list — it is pure computation over `_all`, so it costs nothing to write once
+> and it is unit-testable immediately.
+
 `stall_browsing_vm.dart`. Holds `_all`, `_loading`, `_error`, `_search`,
 `_cuisine`, `_sort` (`enum StallSort { rating, prepTime, name }`). The
 `stalls` getter filters by search and cuisine, sorts by the selected mode,
@@ -5530,28 +5584,32 @@ Future<void> withdraw(String uid, int cents) => _applyDelta(
 credits** — a refund must succeed even against a wallet that has since been
 spent down, or a cancelled order could become unrefundable.
 
-`watchTransactions` takes the optional `types` filter Yong Jun depends on:
+`watchTransactions` takes the optional `types` filter Yong Jun depends on.
+Build the query once in a private helper so the streaming and one-shot reads
+can never diverge:
 
 ```dart
+/// A user's ledger entries, newest first, optionally narrowed to [types].
+Query<Map<String, dynamic>> _ledgerQuery(String uid, List<String>? types) {
+  var query = _txns.where('userId', isEqualTo: uid);
+  if (types != null && types.isNotEmpty) {
+    query = query.where('type', whereIn: types);
+  }
+  return query.orderBy('createdAt', descending: true);
+}
+
 Stream<List<WalletTransaction>> watchTransactions(String uid,
     {List<String>? types}) {
-  return _firestore
-      .collectionStream(
-        AppConstants.transactionsCollection,
-        query: (q) {
-          var query = q.where('userId', isEqualTo: uid);
-          if (types != null && types.isNotEmpty) {
-            query = query.where('type', whereIn: types);
-          }
-          return query.orderBy('createdAt', descending: true);
-        },
-      )
-      .map((rows) => rows.map(WalletTransaction.fromJson).toList());
+  return _ledgerQuery(uid, types).snapshots().map(
+        (snap) => snap.docs
+            .map((d) => WalletTransaction.fromJson(d.data()))
+            .toList(),
+      );
 }
 ```
 
-`getTransactions` is the same query through `getCollection`. **Keep this
-signature stable** — `EarningsRepository` calls it with
+`getTransactions` is the same helper with `.get()` instead of `.snapshots()`.
+**Keep this signature stable** — `EarningsRepository` calls it with
 `types: [txnEarning, txnWithdrawal, txnRefund]`.
 
 **`WalletViewModel`** is deliberately thin — it owns top-ups and the ledger
@@ -5831,13 +5889,14 @@ One review per order is enforced by a query, not a rule:
 
 ```dart
 Future<bool> hasReviewed(String orderId) async {
-  final rows = await _firestore.getCollection(
-    AppConstants.reviewsCollection,
-    query: (q) => q.where('orderId', isEqualTo: orderId).limit(1),
-  );
-  return rows.isNotEmpty;
+  final snap =
+      await _reviews.where('orderId', isEqualTo: orderId).limit(1).get();
+  return snap.docs.isNotEmpty;
 }
 ```
+
+The `.limit(1)` matters: this only ever asks "does one exist?", so reading a
+single document is enough no matter how many reviews the order accumulated.
 
 **`ReviewViewModel`** calls that from `checkExisting(orderId)` in the page's
 `initState` and exposes `alreadyReviewed` so the form renders as a

@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/app_exceptions.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/order.dart';
@@ -14,11 +13,9 @@ import '../../../models/user.dart';
 /// transactions to keep wallets, the order, and the ledger consistent.
 class OrderRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  OrderRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  OrderRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
   CollectionReference<Map<String, dynamic>> get _orders =>
       _db.collection(AppConstants.ordersCollection);
@@ -246,43 +243,39 @@ class OrderRepository {
   }
 
   Future<FoodOrder?> getOrder(String orderId) async {
-    final data = await _firestore
-        .getDocument('${AppConstants.ordersCollection}/$orderId');
+    final snap = await _orders.doc(orderId).get();
+    final data = snap.data();
     return data == null ? null : FoodOrder.fromJson(data);
   }
 
   Stream<FoodOrder?> listenToOrder(String orderId) {
-    return _firestore
-        .documentStream('${AppConstants.ordersCollection}/$orderId')
-        .map((data) => data == null ? null : FoodOrder.fromJson(data));
+    return _orders.doc(orderId).snapshots().map(
+          (snap) =>
+              snap.data() == null ? null : FoodOrder.fromJson(snap.data()!),
+        );
   }
 
   Stream<List<FoodOrder>> watchCustomerOrders(String customerUid) {
-    return _firestore
-        .collectionStream(
-          AppConstants.ordersCollection,
-          query: (q) => q
-              .where('customerUid', isEqualTo: customerUid)
-              .orderBy('createdAt', descending: true),
-        )
-        .map((rows) => rows.map(FoodOrder.fromJson).toList());
+    return _orders
+        .where('customerUid', isEqualTo: customerUid)
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snap) =>
+            snap.docs.map((d) => FoodOrder.fromJson(d.data())).toList());
   }
 
   Stream<List<FoodOrder>> watchVendorOrders(
     String vendorUid, {
     List<String>? statuses,
   }) {
-    return _firestore
-        .collectionStream(
-          AppConstants.ordersCollection,
-          query: (q) {
-            var query = q.where('vendorUid', isEqualTo: vendorUid);
-            if (statuses != null && statuses.isNotEmpty) {
-              query = query.where('status', whereIn: statuses);
-            }
-            return query.orderBy('createdAt', descending: true);
-          },
-        )
-        .map((rows) => rows.map(FoodOrder.fromJson).toList());
+    var query = _orders.where('vendorUid', isEqualTo: vendorUid);
+    if (statuses != null && statuses.isNotEmpty) {
+      query = query.where('status', whereIn: statuses);
+    }
+    return query
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snap) =>
+            snap.docs.map((d) => FoodOrder.fromJson(d.data())).toList());
   }
 }

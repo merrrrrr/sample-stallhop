@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/order.dart';
 import '../../../models/stall.dart';
@@ -11,15 +10,12 @@ import '../../customer/repository/order_repository.dart';
 /// [OrderRepository] so the transactional wallet logic stays in one place.
 class VendorOrderRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
   final OrderRepository _orderRepository;
 
   VendorOrderRepository({
     FirebaseFirestore? db,
-    FirestoreService? firestore,
     OrderRepository? orderRepository,
   })  : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db),
         _orderRepository = orderRepository ?? OrderRepository(db: db);
 
   CollectionReference<Map<String, dynamic>> get _stalls =>
@@ -27,21 +23,20 @@ class VendorOrderRepository {
 
   // --- Stall ---
 
+  Query<Map<String, dynamic>> _myStallQuery(String vendorUid) =>
+      _stalls.where('vendorUid', isEqualTo: vendorUid).limit(1);
+
   Stream<Stall?> watchMyStall(String vendorUid) {
-    return _firestore
-        .collectionStream(
-          AppConstants.stallsCollection,
-          query: (q) => q.where('vendorUid', isEqualTo: vendorUid).limit(1),
-        )
-        .map((rows) => rows.isEmpty ? null : Stall.fromJson(rows.first));
+    return _myStallQuery(vendorUid).snapshots().map(
+          (snap) => snap.docs.isEmpty
+              ? null
+              : Stall.fromJson(snap.docs.first.data()),
+        );
   }
 
   Future<Stall?> getMyStall(String vendorUid) async {
-    final rows = await _firestore.getCollection(
-      AppConstants.stallsCollection,
-      query: (q) => q.where('vendorUid', isEqualTo: vendorUid).limit(1),
-    );
-    return rows.isEmpty ? null : Stall.fromJson(rows.first);
+    final snap = await _myStallQuery(vendorUid).get();
+    return snap.docs.isEmpty ? null : Stall.fromJson(snap.docs.first.data());
   }
 
   /// Creates a new stall in `pending` status awaiting admin approval.

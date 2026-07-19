@@ -1,32 +1,35 @@
-import '../../../core/services/firestore_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 import '../../../core/utils/constants.dart';
 import '../../../models/user.dart';
 
-/// User-document CRUD on top of [FirestoreService].
+/// User-document CRUD at `users/{uid}`.
 class AuthRepository {
-  final FirestoreService _firestore;
+  final FirebaseFirestore _db;
 
-  AuthRepository({FirestoreService? firestore})
-      : _firestore = firestore ?? FirestoreService();
+  AuthRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
-  String get _col => AppConstants.usersCollection;
+  DocumentReference<Map<String, dynamic>> _userRef(String uid) =>
+      _db.collection(AppConstants.usersCollection).doc(uid);
 
   Future<void> createUser(AppUser user) {
-    return _firestore.setDocument('$_col/${user.uid}', user.toJson());
+    return _userRef(user.uid).set(user.toJson());
   }
 
   Future<AppUser?> getUser(String uid) async {
-    final data = await _firestore.getDocument('$_col/$uid');
+    final snap = await _userRef(uid).get();
+    final data = snap.data();
     return data == null ? null : AppUser.fromJson(data);
   }
 
   Stream<AppUser?> watchUser(String uid) {
-    return _firestore
-        .documentStream('$_col/$uid')
-        .map((data) => data == null ? null : AppUser.fromJson(data));
+    return _userRef(uid).snapshots().map(
+          (snap) => snap.data() == null ? null : AppUser.fromJson(snap.data()!),
+        );
   }
 
   Future<void> updateUser(String uid, Map<String, dynamic> data) {
-    return _firestore.updateDocument('$_col/$uid', data);
+    return _userRef(uid).update(data);
   }
 }

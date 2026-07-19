@@ -1,6 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-import '../../../core/services/firestore_service.dart';
 import '../../../core/utils/constants.dart';
 import '../../../models/review.dart';
 
@@ -9,11 +8,9 @@ import '../../../models/review.dart';
 /// Cloud Function).
 class ReviewRepository {
   final FirebaseFirestore _db;
-  final FirestoreService _firestore;
 
-  ReviewRepository({FirebaseFirestore? db, FirestoreService? firestore})
-      : _db = db ?? FirebaseFirestore.instance,
-        _firestore = firestore ?? FirestoreService(db: db);
+  ReviewRepository({FirebaseFirestore? db})
+      : _db = db ?? FirebaseFirestore.instance;
 
   CollectionReference<Map<String, dynamic>> get _reviews =>
       _db.collection(AppConstants.reviewsCollection);
@@ -46,33 +43,25 @@ class ReviewRepository {
     });
   }
 
+  Query<Map<String, dynamic>> _stallQuery(String stallId) => _reviews
+      .where('stallId', isEqualTo: stallId)
+      .orderBy('createdAt', descending: true);
+
   Future<List<Review>> getStallReviews(String stallId) async {
-    final rows = await _firestore.getCollection(
-      AppConstants.reviewsCollection,
-      query: (q) => q
-          .where('stallId', isEqualTo: stallId)
-          .orderBy('createdAt', descending: true),
-    );
-    return rows.map(Review.fromJson).toList();
+    final snap = await _stallQuery(stallId).get();
+    return snap.docs.map((d) => Review.fromJson(d.data())).toList();
   }
 
   Stream<List<Review>> watchStallReviews(String stallId) {
-    return _firestore
-        .collectionStream(
-          AppConstants.reviewsCollection,
-          query: (q) => q
-              .where('stallId', isEqualTo: stallId)
-              .orderBy('createdAt', descending: true),
-        )
-        .map((rows) => rows.map(Review.fromJson).toList());
+    return _stallQuery(stallId).snapshots().map(
+          (snap) => snap.docs.map((d) => Review.fromJson(d.data())).toList(),
+        );
   }
 
   /// True if a review already exists for [orderId] (one review per order).
   Future<bool> hasReviewed(String orderId) async {
-    final rows = await _firestore.getCollection(
-      AppConstants.reviewsCollection,
-      query: (q) => q.where('orderId', isEqualTo: orderId).limit(1),
-    );
-    return rows.isNotEmpty;
+    final snap =
+        await _reviews.where('orderId', isEqualTo: orderId).limit(1).get();
+    return snap.docs.isNotEmpty;
   }
 }
